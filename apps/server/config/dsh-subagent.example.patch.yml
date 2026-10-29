@@ -1,0 +1,14 @@
+# Example only. The investigation pipeline does not load this patch.
+- insert:
+    - id: subagent-service
+      name: '@deepseek-ai/dsh-subagent'
+      config:
+        maxActiveSubagents: 2
+    - id: subagent-spawn
+      name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        maxDepth: 1

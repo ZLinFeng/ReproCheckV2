@@ -1,0 +1,11 @@
+default:
+  provider: openai-compatible
+  model: gpt-4.1-mini
+
+providers:
+  openai-compatible:
+    baseUrl: https://api.openai.com/v1
+    key: "replace-with-your-api-key"
+    models:
+      - gpt-4.1-mini
+      - gpt-4.1

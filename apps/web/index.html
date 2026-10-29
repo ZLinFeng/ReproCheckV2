@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f5f0">
+    <meta name="description" content="Investigate project claims, examine evidence, and record the verification process.">
+    <title>ReproCheck — Evidence you can trace</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div class="page" id="page">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="ReproCheck home">
+          <span class="brand-mark" aria-hidden="true">r<span>.</span></span>
+          <span class="brand-name">repro<span>check</span><small>Verification workspace</small></span>
+        </a>
+        <div class="topbar-note"><span class="topbar-line" aria-hidden="true"></span>From claims to evidence</div>
+      </header>
+
+      <main class="workspace" id="workspace">
+        <section class="intro" aria-labelledby="page-title">
+          <div class="intro-copy">
+            <div class="eyebrow"><span class="eyebrow-square" aria-hidden="true"></span>RESEARCH, WITH RECEIPTS</div>
+            <h1 id="page-title">One link.<br><em>Evidence in focus.</em></h1>
+            <p class="intro-description">Enter a GitHub repository to start an evidence-led investigation.</p>
+          </div>
+          <form class="url-form" id="url-form" novalidate>
+            <label class="sr-only" for="repo-url">GitHub repository URL</label>
+            <div class="input-shell" id="input-shell">
+              <span class="input-symbol" aria-hidden="true">↗</span>
+              <input id="repo-url" name="url" type="url" inputmode="url" autocomplete="url" spellcheck="false"
+                placeholder="https://github.com/owner/repository" aria-describedby="input-help input-error" required>
+              <button class="submit-button" id="submit-button" type="submit"><span>Start investigation</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+            </div>
+            <div class="input-meta"><p id="input-help">Public GitHub repository URLs only</p><p id="input-error" class="input-error" role="alert"></p><span class="enter-hint">ENTER <span aria-hidden="true">↵</span></span></div>
+          </form>
+          <div class="intro-footer" id="intro-footer"><span>Analyze claims</span><span class="footer-separator" aria-hidden="true">/</span><span>Find evidence</span><span class="footer-separator" aria-hidden="true">/</span><span>Record results</span></div>
+        </section>
+
+        <section class="investigation" id="investigation" hidden aria-label="Investigation progress">
+          <div class="workspace-heading">
+            <div><p class="section-kicker">INVESTIGATION / ACTIVITY</p><h2>Investigation in progress<span class="heading-period">.</span></h2></div>
+            <div class="run-controls"><span class="run-status" id="run-status" role="status"><span class="status-dot" aria-hidden="true"></span><span id="run-status-text">Preparing</span></span><button type="button" class="stop-button" id="stop-button">Stop investigation</button></div>
+          </div>
+
+          <div class="investigation-grid">
+            <section class="feed-panel" aria-labelledby="feed-title">
+              <div class="panel-heading"><div><p class="panel-kicker">LIVE ACTIVITY</p><h3 id="feed-title">Investigation activity</h3></div><span class="panel-label" id="feed-label">Waiting to start</span></div>
+              <p class="feed-intro">Stage updates, analysis, and execution results appear here.</p>
+              <div class="feed-scroll" id="feed-scroll" tabindex="0" aria-label="Investigation activity, independently scrollable">
+                <ol class="timeline" id="timeline" aria-live="polite" aria-relevant="additions text"></ol>
+                <div class="feed-empty" id="feed-empty"><span class="empty-mark" aria-hidden="true">✳</span><p>Connecting</p><small>Activity will appear here once the investigation starts.</small></div>
+                <div class="error-banner" id="run-error" role="alert" hidden></div>
+              </div>
+            </section>
+
+            <section class="results-panel" aria-labelledby="results-title">
+              <div class="panel-heading results-heading"><div><p class="panel-kicker">INVESTIGATION NOTES</p><h3 id="results-title">Investigation results</h3></div><span class="panel-label" id="results-label">Waiting for results</span></div>
+              <div class="results-scroll" id="results-scroll" tabindex="0" aria-label="Investigation results, independently scrollable">
+                <div class="results-intro"><div><p class="brief-label">REPOSITORY</p><p class="repo-name" id="repo-name">—</p><p class="repo-url" id="repo-display">—</p></div><span class="results-intro-mark" aria-hidden="true">↗</span></div>
+                <div id="result-cards" class="result-cards"></div>
+                <div class="results-empty" id="results-empty"><span aria-hidden="true">✳</span><p>Results will appear here as they arrive</p><small>Claims, plans, sources, and experiment results will be collected here.</small></div>
+                <section class="report-panel" id="report-panel" hidden aria-labelledby="report-title">
+                  <div class="panel-heading report-heading"><div><p class="panel-kicker">FINAL ASSESSMENT</p><h3 id="report-title">Investigation report</h3></div><span class="report-tag">Evidence overview</span></div>
+                  <p class="report-summary" id="report-summary"></p>
+                  <div class="findings" id="findings"></div>
+                  <div class="report-bottom"><p id="report-limitation"></p><a id="report-link" href="#" target="_blank" rel="noopener noreferrer">View full report <span aria-hidden="true">↗</span></a></div>
+                </section>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+      <footer class="site-footer"><span>REPROCHECK <span class="footer-dot">●</span> Verification workspace</span><span>Evidence behind every conclusion.</span></footer>
+    </div>
+  </body>
+</html>

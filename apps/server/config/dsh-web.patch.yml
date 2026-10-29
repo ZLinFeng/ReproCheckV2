@@ -1,0 +1,37 @@
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: terminal-bash
+  disabled: true
+- id: terminal-pwsh
+  disabled: true
+- id: pty
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: mcp-resources
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+- id: llm-deepseek
+  disabled: true
+- id: deepseek-llm-api-extensions
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+- insert:
+    - id: web
+      name: '@deepseek-ai/dsh-web'
+      config:
+        fetchProvider: http
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+    - id: tool-web
+      name: '@deepseek-ai/dsh-tool-web'
+      config:
+        search: false
+    - id: timeout-policy
+      name: '@deepseek-ai/dsh-tool-call-timeout-policy'

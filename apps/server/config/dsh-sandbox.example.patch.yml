@@ -1,0 +1,4 @@
+# Example only: the SDK's file policy is not a network or process isolation boundary.
+- id: sandbox-policy
+  config:
+    mode: read-only
