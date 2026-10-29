@@ -10,6 +10,9 @@
     "test": "tsx --test src/*.test.ts"
   },
   "dependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-sandbox": "0.2.1-rc.4",
+    "@deepseek-ai/dsh-sandbox-local": "0.2.1-rc.4",
     "@deepseek-ai/dsh-sdk-client": "0.2.1-rc.4",
     "fastify": "^5.12.7",
     "fastify-plugin": "^6.0.1",

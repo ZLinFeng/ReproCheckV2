@@ -16,7 +16,7 @@ export async function searchOnline(root: string, queries: SearchQuery[], signal?
   const input = Buffer.from(JSON.stringify(queries.slice(0, 4))).toString('base64');
   const command = `python -I -c 'import base64,sys;sys.argv[1]=base64.b64decode(sys.argv[1]).decode();exec(base64.b64decode("${code}"))' ${input}`;
   const result = await runBenchmark(root, { runtime: 'python', network: true, command, metric: 'sources', unit: 'count',
-    comparison: 'gte', expected: 0, basis: 'online search' }, signal, undefined, false);
+    comparison: 'gte', expected: 0, basis: 'online search' }, signal, undefined, false, undefined, undefined, true);
   if (result.status !== 'measured') {
     const reason = 'error' in result ? result.error : result.status === 'failed' && 'stderr' in result ? result.stderr.slice(0, 300) : result.status;
     return { searches: [], sources: [], errors: [{ error: `Online search failed: ${reason || result.status}` }] };

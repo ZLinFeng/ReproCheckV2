@@ -25,6 +25,8 @@ export async function createWebHarness(this: FastifyInstance, options?: { analys
               api: 'openai-completions',
               baseURL: baseUrl,
               apiKeyEnv: 'REPROCHECK_MODEL_API_KEY',
+              timeoutMs: 15 * 60_000,
+              streamIdleTimeoutMs: 15 * 60_000,
               models: [{ id: model, ...limits }],
             },
           },
@@ -46,7 +48,7 @@ export async function createWebHarness(this: FastifyInstance, options?: { analys
       },
       maxTokens: limits?.maxTokens ?? 8192,
       initializeTimeoutMs: 30000,
-      requestTimeoutMs: 60 * 1000 * 30,
+      requestTimeoutMs: 60 * 60_000,
     });
 
     return {

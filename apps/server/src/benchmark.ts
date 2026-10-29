@@ -1,10 +1,12 @@
-import { randomUUID } from 'node:crypto';
-import { networkInterfaces } from 'node:os';
-import { tmpdir } from 'node:os';
-import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { arch, platform, release, tmpdir } from 'node:os';
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { classifyRunnerFailure, isRunnerSpawnFailure } from '@deepseek-ai/dsh-sandbox';
+import type { Server } from 'node:http';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 import { runProcess } from './process.js';
+import { sandbox } from './sandbox.js';
 
 export type Benchmark = {
   runtime: 'python' | 'node';
@@ -18,6 +20,8 @@ export type Benchmark = {
   expected: number | null;
   basis: string;
 };
+
+export type BenchmarkProgress = { task: string; status: 'completed' | 'failed' | 'timed_out'; arms?: object };
 
 export function parseBenchmark(value: unknown): Benchmark | null {
   if (value === null || value === undefined) return null;
@@ -46,77 +50,107 @@ export async function findPi() {
   } catch { return null; }
 }
 
+const require = createRequire(import.meta.url);
+const { createProxy } = require('../config/egress-proxy.cjs') as { createProxy: (model?: { baseUrl: string; key: string; model: string }) => Server };
+
+export async function hostCapabilities(signal?: AbortSignal) {
+  const env = { PATH: process.env.PATH };
+  const tools: Record<string, { path: string; version: string } | null> = {};
+  for (const name of ['node', 'npm', 'python', 'python3', 'pip', 'git', 'curl']) {
+    try {
+      const found = await runProcess('which', [name], { cwd: tmpdir(), env, signal, timeoutMs: 5000, maxBytes: 2000 });
+      if (found.code !== 0) { tools[name] = null; continue; }
+      const path = found.stdout.trim().split('\n')[0];
+      const version = await runProcess(path, ['--version'], { cwd: tmpdir(), env, signal, timeoutMs: 5000, maxBytes: 2000 });
+      tools[name] = { path, version: (version.stdout || version.stderr).trim().split('\n')[0].slice(0, 200) };
+    } catch { if (signal?.aborted) throw signal.reason; tools[name] = null; }
+  }
+  return { platform: platform(), release: release(), architecture: arch(), tools };
+}
+
 export async function runBenchmark(root: string, benchmark: Benchmark, signal?: AbortSignal,
   model?: { baseUrl: string; key: string; model: string; limits?: { contextWindow: number; maxTokens: number } },
-  copyRepository = true) {
-  const name = `reprocheck-${randomUUID()}`;
-  const network = `${name}-network`;
-  const proxy = `${name}-proxy`;
-  const image = benchmark.runtime === 'python' ? 'python:3.12-alpine' : 'node:22-alpine';
-  const env = { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_HOST: process.env.DOCKER_HOST,
-    DOCKER_CONFIG: process.env.DOCKER_CONFIG, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT };
-  const common = { cwd: root, env, signal, timeoutMs: 15000, maxBytes: 250_000 };
-  let secretDir: string | undefined;
+  copyRepository = true, onInterrupted?: (output: { stdout: string; stderr: string }) => void,
+  onProgress?: (progress: BenchmarkProgress) => void, publicSearchProxy = false) {
+  let workspace: string | undefined;
+  let proxy: Server | undefined;
   try {
     const pi = benchmark.agent ? await findPi() : null;
     if (benchmark.agent && !pi) return { status: 'unavailable' as const, error: 'A supported local Pi CLI was not found.' };
-    if (benchmark.model && (!model || !URL.canParse(model.baseUrl) || new URL(model.baseUrl).protocol !== 'https:')) {
-      return { status: 'unavailable' as const, error: 'The configured model service is unavailable; a public HTTPS OpenAI-compatible endpoint is required.' };
+    if (benchmark.model && (!model || !URL.canParse(model.baseUrl) || !['http:', 'https:'].includes(new URL(model.baseUrl).protocol))) {
+      return { status: 'unavailable' as const, error: 'The configured model service is unavailable; an HTTP(S) OpenAI-compatible endpoint is required.' };
     }
-    const inspected = await runProcess('docker', ['image', 'inspect', image, '--format', '{{.Id}}'], common);
-    const imageId = inspected.stdout.trim();
-    if (inspected.code !== 0 || !/^sha256:[a-f0-9]{64}$/.test(imageId)) return { status: 'unavailable' as const, error: 'The local runtime image was not found.' };
-    if (benchmark.network) {
-      const proxyImage = await runProcess('docker', ['image', 'inspect', 'node:22-alpine', '--format', '{{.Id}}'], common);
-      const proxyImageId = proxyImage.stdout.trim();
-      if (proxyImage.code !== 0 || !/^sha256:[a-f0-9]{64}$/.test(proxyImageId)) return { status: 'unavailable' as const, error: 'Networked experiments require a local node:22-alpine proxy image.' };
-      const networkResult = await runProcess('docker', ['network', 'create', '--internal', network], common);
-      if (networkResult.code !== 0) return { status: 'unavailable' as const, error: 'Could not create the isolated network.' };
-      const proxyScript = fileURLToPath(new URL('../config/egress-proxy.cjs', import.meta.url));
-      const hostAddresses = Object.values(networkInterfaces()).flatMap((items) => (items || []).map((item) => item.address.split('%')[0]));
-      let modelMount: string[] = [];
+    const capabilities = await hostCapabilities(signal);
+    const python = capabilities.tools.python || capabilities.tools.python3;
+    if (benchmark.runtime === 'python' && !python) return { status: 'unavailable' as const, error: 'Python was not found on the host.' };
+    if (benchmark.runtime === 'node' && !capabilities.tools.node) return { status: 'unavailable' as const, error: 'Node.js was not found on the host.' };
+    workspace = await realpath(await mkdtemp(join(tmpdir(), 'reprocheck-run-')));
+    const bin = join(workspace, 'bin');
+    const home = join(workspace, 'home');
+    const cwd = copyRepository ? join(workspace, 'repository') : workspace;
+    await mkdir(bin);
+    await mkdir(home);
+    if (copyRepository) await cp(root, cwd, { recursive: true, verbatimSymlinks: true });
+    if (!capabilities.tools.python && python) await symlink(python.path, join(bin, 'python'));
+    const env: NodeJS.ProcessEnv = { PATH: `${bin}:${process.env.PATH || '/usr/bin:/bin'}`, HOME: home,
+      TMPDIR: workspace, LANG: 'C.UTF-8', REPROCHECK_WORKSPACE: workspace, NO_PROXY: '*', no_proxy: '*' };
+    if ((benchmark.model && model) || publicSearchProxy) {
+      proxy = createProxy(benchmark.model ? model : undefined);
+      await new Promise<void>((resolve, reject) => { proxy!.once('error', reject); proxy!.listen(0, '127.0.0.1', resolve); });
+      const address = proxy.address();
+      if (!address || typeof address === 'string') throw new Error('Model proxy did not start.');
+      const proxyUrl = `http://127.0.0.1:${address.port}`;
+      if (publicSearchProxy) Object.assign(env, { HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, http_proxy: proxyUrl, https_proxy: proxyUrl, NO_PROXY: '', no_proxy: '' });
       if (benchmark.model && model) {
-        secretDir = await mkdtemp(join(tmpdir(), 'reprocheck-model-'));
-        const secretPath = join(secretDir, 'model.json');
-        await writeFile(secretPath, JSON.stringify({ baseUrl: model.baseUrl, key: model.key, model: model.model }), { mode: 0o444 });
-        modelMount = ['--env', 'MODEL_CONFIG=/model.json', '--mount', `type=bind,src=${secretPath},dst=/model.json,readonly`];
+        env.REPROCHECK_MODEL_ID = model.model;
+        env.REPROCHECK_MODEL_BASE_URL = `${proxyUrl}/reprocheck-model/v1`;
+        env.REPROCHECK_MODEL_API_KEY = 'local';
       }
-      const proxyArgs = ['create', '--name', proxy, '--pull=never', '--network', network, '--network-alias', 'egress',
-        '--read-only', '--log-driver=none', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=64',
-        '--memory=128m', '--cpus=0.5', '--user=65534:65534', '--env', `HOST_ADDRESSES=${JSON.stringify(hostAddresses)}`,
-        '--mount', `type=bind,src=${proxyScript},dst=/proxy.cjs,readonly`, ...modelMount,
-        '--entrypoint', 'node', proxyImageId, '/proxy.cjs'];
-      const createdProxy = await runProcess('docker', proxyArgs, common);
-      if (createdProxy.code !== 0) return { status: 'unavailable' as const, error: 'Could not create the network egress proxy.' };
-      const startedProxy = await runProcess('docker', ['start', proxy], common);
-      if (startedProxy.code !== 0) return { status: 'unavailable' as const, error: 'Could not start the network egress proxy.' };
-      const connected = await runProcess('docker', ['network', 'connect', 'bridge', proxy], common);
-      if (connected.code !== 0) return { status: 'unavailable' as const, error: 'Could not connect the network egress proxy.' };
-      const ready = await runProcess('docker', ['exec', proxy, 'node', '-e',
-        `const net=require('net'),os=require('os');const ip=(os.networkInterfaces().eth0||[]).find(x=>x.family==='IPv4')?.address;let n=0;function check(){const s=net.connect(3128,ip);s.on('connect',()=>{s.destroy();process.exit(0)});s.on('error',()=>{if(++n===30)process.exit(1);setTimeout(check,100)})}check()`], common);
-      if (ready.code !== 0 || ready.timedOut) return { status: 'unavailable' as const, error: 'The network egress proxy is not ready.' };
     }
-    const proxyEnv = benchmark.network ? ['--env', 'HTTP_PROXY=http://egress:3128', '--env', 'HTTPS_PROXY=http://egress:3128',
-      '--env', 'http_proxy=http://egress:3128', '--env', 'https_proxy=http://egress:3128', '--env', 'NO_PROXY=egress', '--env', 'no_proxy=egress'] : [];
-    const modelEnv = benchmark.model && model ? ['--env', `REPROCHECK_MODEL_ID=${model.model}`,
-      '--env', 'REPROCHECK_MODEL_BASE_URL=http://egress:3128/reprocheck-model/v1', '--env', 'REPROCHECK_MODEL_API_KEY=local'] : [];
-    const piMount = pi ? ['--mount', `type=bind,src=${pi.root},dst=/opt/reprocheck-pi,readonly`,
-      '--env', 'PATH=/work/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', '--env', 'PI_CODING_AGENT_DIR=/work/pi-agent'] : [];
-    const piSetup = pi ? `mkdir -p /work/bin /work/pi-agent && printf '#!/bin/sh\nexec node /opt/reprocheck-pi/dist/bundle/cli.js "$@"\n' > /work/bin/pi && chmod 755 /work/bin/pi && ` : '';
-    const modelSetup = benchmark.agent && benchmark.model && model ? `node -e 'require("fs").writeFileSync("/work/pi-agent/models.json",JSON.stringify({providers:{reprocheck:{baseUrl:process.env.REPROCHECK_MODEL_BASE_URL,api:"openai-completions",apiKey:"local",models:[{id:process.env.REPROCHECK_MODEL_ID,contextWindow:${model.limits?.contextWindow ?? 128000},maxTokens:${model.limits?.maxTokens ?? 8192}}]}}}))' && ` : '';
-    const args = ['create', '--name', name, '--pull=never', '--network', benchmark.network ? network : 'none',
-      ...(benchmark.network ? ['--dns', '127.0.0.1'] : []), '--read-only', '--log-driver=none',
-      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=64', '--memory=1536m', '--cpus=1',
-      '--user=65534:65534', '--env', 'HOME=/work', ...proxyEnv, ...modelEnv, ...piMount, '--tmpfs', '/work:rw,exec,nosuid,nodev,size=1g,nr_inodes=131072,mode=1777',
-      ...(copyRepository ? ['--mount', `type=bind,src=${root},dst=/source,readonly`] : []), '--workdir', '/work', '--entrypoint', '/bin/sh', imageId,
-      '-c', `/bin/sh -n -c "$1" || exit $?; ${piSetup}${modelSetup}${copyRepository ? 'mkdir /work/repository && cp -R /source/. /work/repository/ && cd /work/repository && ' : ''}exec /bin/sh -c "$1"`,
-      'reprocheck', benchmark.command];
-    const created = await runProcess('docker', args, common);
-    if (created.code !== 0 || created.timedOut) return { status: 'unavailable' as const, error: 'Could not create the isolated container; check Docker and the local runtime image.' };
+    if (pi) {
+      env.PI_CODING_AGENT_DIR = join(workspace, 'pi-agent');
+      await mkdir(env.PI_CODING_AGENT_DIR);
+      if (benchmark.model && model) await writeFile(join(env.PI_CODING_AGENT_DIR, 'models.json'), JSON.stringify({
+        providers: { reprocheck: { baseUrl: env.REPROCHECK_MODEL_BASE_URL, api: 'openai-completions', apiKey: 'local',
+          models: [{ id: model.model, contextWindow: model.limits?.contextWindow ?? 128000, maxTokens: model.limits?.maxTokens ?? 8192 }] } },
+      }));
+    }
+    const confined = await sandbox.confine(['/bin/sh', '-c', benchmark.command], { mode: 'workspace-write', workspaceRoot: workspace }, signal);
     const started = Date.now();
-    const result = await runProcess('docker', ['start', '--attach', name], { ...common, timeoutMs: 300000 });
     const redact = (value: string) => benchmark.model && model?.key ? value.split(model.key).join('[redacted]') : value;
-    const output = { image, imageId, network: benchmark.network ? 'public-proxy' : 'none',
+    const decoder = new StringDecoder('utf8');
+    let pending = '';
+    const progressChunk = (chunk: Buffer) => {
+      if (!onProgress) return;
+      pending += decoder.write(chunk);
+      const lines = pending.split('\n');
+      pending = (lines.pop() || '').slice(-8192);
+      for (const line of lines) {
+        if (!line.startsWith('REPROCHECK_PROGRESS ') || line.length > 8192) continue;
+        try {
+          const item: unknown = JSON.parse(redact(line.slice('REPROCHECK_PROGRESS '.length)));
+          if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+          const entry = item as Record<string, unknown>;
+          if (typeof entry.task !== 'string' || !entry.task.trim() || entry.task.length > 200
+            || !['completed', 'failed', 'timed_out'].includes(String(entry.status))
+            || (entry.arms !== undefined && (!entry.arms || typeof entry.arms !== 'object' || Array.isArray(entry.arms)))) continue;
+          onProgress({ task: entry.task, status: entry.status as BenchmarkProgress['status'], ...(entry.arms ? { arms: entry.arms as object } : {}) });
+        } catch { /* Progress is untrusted; malformed lines remain in the execution log. */ }
+      }
+    };
+    let result;
+    try {
+      result = await runProcess(confined.argv[0], confined.argv.slice(1), { cwd, env, signal, timeoutMs: 30 * 60_000, maxBytes: 250_000,
+        onAbortOutput: (output) => onInterrupted?.({ stdout: redact(output.stdout), stderr: redact(output.stderr) }), onStderr: progressChunk });
+    } catch (error) {
+      if (isRunnerSpawnFailure(error, confined.argv[0], cwd)) return { status: 'unavailable' as const, error: 'The DSH sandbox runner could not be started.' };
+      throw error;
+    }
+    if (result.code !== 0 && classifyRunnerFailure(result.code, result.stderr, confined.runnerFailureRules)) {
+      return { status: 'unavailable' as const, error: 'The DSH sandbox runner could not enforce its policy.' };
+    }
+    const output = { environment: { ...capabilities, sandbox: { provider: 'dsh-local', mode: 'workspace-write',
+      enforcement: confined.enforcement }, network: 'host-unrestricted', networkRequested: benchmark.network },
       ...(pi ? { agent: { name: 'pi', version: pi.version } } : {}), ...(benchmark.model && model ? { model: model.model } : {}),
       elapsedMs: Date.now() - started, stdout: redact(result.stdout), stderr: redact(result.stderr), exitCode: result.code, timedOut: result.timedOut };
     if (result.timedOut || result.code !== 0) return { status: 'failed' as const, ...output };
@@ -130,14 +164,10 @@ export async function runBenchmark(root: string, benchmark: Benchmark, signal?: 
     return { status: 'measured' as const, actual, matched, ...output };
   } catch (error) {
     if (signal?.aborted) throw signal.reason;
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { status: 'unavailable' as const, error: 'Docker was not found.' };
-    return { status: 'failed' as const, error: error instanceof Error ? error.message : 'Container execution failed.' };
+    if ((error as { code?: string })?.code === 'SANDBOX_UNAVAILABLE') return { status: 'unavailable' as const, error: 'The DSH sandbox is unavailable on this host.' };
+    return { status: 'failed' as const, error: error instanceof Error ? error.message : 'Host execution failed.' };
   } finally {
-    await runProcess('docker', ['rm', '-f', name], { cwd: root, env, timeoutMs: 15000, maxBytes: 5000 }).catch(() => {});
-    if (benchmark.network) {
-      await runProcess('docker', ['rm', '-f', proxy], { cwd: root, env, timeoutMs: 15000, maxBytes: 5000 }).catch(() => {});
-      await runProcess('docker', ['network', 'rm', network], { cwd: root, env, timeoutMs: 15000, maxBytes: 5000 }).catch(() => {});
-    }
-    if (secretDir) await rm(secretDir, { recursive: true, force: true }).catch(() => {});
+    if (proxy) { proxy.closeAllConnections(); await new Promise<void>((resolve) => proxy!.close(() => resolve())); }
+    if (workspace) await rm(workspace, { recursive: true, force: true });
   }
 }

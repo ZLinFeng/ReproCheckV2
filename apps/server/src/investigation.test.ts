@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { app } from './app.js';
-import { findDocuments, investigate, parseProject, resultsDir } from './investigation.js';
+import { findDocuments, investigate, InvestigationTimeoutError, parseProject, resultsDir } from './investigation.js';
 
 const project = { type: 'other', installation: 'simple', missingRequirements: [], reason: 'Python project with ordinary installation' };
 const experiment = { installation: 'none', installationReason: 'No installation required', missingRequirements: [], network: false, blockedReason: null };
@@ -43,7 +43,7 @@ test('persists claims, an evidence plan, sandbox observations and a cautious rep
   await writeFile(git, `#!/bin/sh\ncase "$*" in\n  *clone*) for last; do :; done; /bin/mkdir -p "$last"; printf 'Uses 30%% less time.\\n' > "$last/README.md";;\n  *rev-parse*) printf '0123456789012345678901234567890123456789\\n';;\nesac\n`);
   await chmod(git, 0o755);
   const oldPath = process.env.PATH;
-  process.env.PATH = `${fakeBin}:/usr/local/bin:/usr/bin:/bin`;
+  process.env.PATH = `${fakeBin}:${oldPath || "/usr/local/bin:/usr/bin:/bin"}`;
   const id = randomUUID();
   t.after(async () => {
     process.env.PATH = oldPath;
@@ -83,7 +83,7 @@ test('persists claims, an evidence plan, sandbox observations and a cautious rep
   assert.equal(JSON.parse(await readFile(join(resultsDir, id, 'report.json'), 'utf8')).id, id);
   assert.equal(closed, true);
 
-  if (spawnSync('docker', ['image', 'inspect', 'python:3.12-alpine'], { stdio: 'ignore', timeout: 5000 }).status === 0) {
+  if (spawnSync('python', ['--version'], { stdio: 'ignore', timeout: 5000 }).status === 0) {
     const measuredId = randomUUID();
     t.after(() => rm(join(resultsDir, measuredId), { recursive: true, force: true }));
     answers.push(
@@ -104,9 +104,9 @@ test('persists claims, an evidence plan, sandbox observations and a cautious rep
     answers.push(
       { summary: 'One claim', claims: [{ id: 'c1', claim: '30% less time', sourcePath: 'README.md', quote: 'Uses 30% less time.' }] },
       { assessment: 'Fixture', project, experiments: [{ ...experiment, claimId: 'c1', path: 'README.md', method: 'Read', reproduction: 'Fixture measurement',
-        benchmark: { runtime: 'python', network: false, command: `python -c 'open("/work/repositoryREADME.md")'`,
+        benchmark: { runtime: 'python', network: false, command: `python -c 'open("repositoryREADME.md")'`,
           metric: 'characters', unit: 'count', comparison: 'eq', expected: 20, basis: 'test fixture' } }] },
-      { command: `python -c 'import json; print(json.dumps({"value": len(open("README.md").read())}))'` },
+      { benchmark: { command: `python -c 'import json; print(json.dumps({"value": len(open("README.md").read())}))'` } },
       { summary: 'Fixture only', findings: [{ claimId: 'c1', status: 'inconclusive', explanation: 'A repaired fixture', nextStep: 'Run a real benchmark.' }] },
     );
     const retryDetails: { stage: string; data: object }[] = [];
@@ -120,6 +120,68 @@ test('persists claims, an evidence plan, sandbox observations and a cautious rep
     const saved = JSON.parse(await readFile(join(resultsDir, retryId, 'benchmark.json'), 'utf8'));
     assert.match(saved.runs[0].attempts[0].result.stderr, /repositoryREADME/);
     assert.equal(saved.runs[0].attempts[1].result.actual, 20);
+
+    const timeoutId = randomUUID();
+    t.after(() => rm(join(resultsDir, timeoutId), { recursive: true, force: true }));
+    const timeout = new AbortController();
+    answers.push(
+      { summary: 'Two claims', claims: [
+        { id: 'c1', claim: '30% less time', sourcePath: 'README.md', quote: 'Uses 30% less time.' },
+        { id: 'c2', claim: '30% less time', sourcePath: 'README.md', quote: 'Uses 30% less time.' }] },
+      { assessment: 'Fixture', project, experiments: [{ ...experiment, claimId: 'c1', path: 'README.md', method: 'Read', reproduction: 'Fixture measurement',
+        benchmark: { runtime: 'python', network: false, command: `python -c 'open("repositoryREADME.md")'`,
+          metric: 'characters', unit: 'count', comparison: 'eq', expected: 20, basis: 'test fixture' } }] },
+    );
+    const partial = await investigate(app, 'https://github.com/owner/repo', timeoutId, timeout.signal, () => {}, (stage, data) => {
+      if (stage === 'benchmark' && 'status' in data && data.status === 'retrying') timeout.abort(new InvestigationTimeoutError());
+    });
+    assert.equal(partial.partial, true);
+    assert.deepEqual(partial.benchmark.runs.map((run) => run.status), ['interrupted', 'not_executed']);
+    assert.ok('attempts' in partial.benchmark.runs[0]);
+    assert.deepEqual(partial.findings.map((finding) => finding.status), ['inconclusive', 'inconclusive']);
+    assert.equal(JSON.parse(await readFile(join(resultsDir, timeoutId, 'status.json'), 'utf8')).status, 'timed_out');
+    assert.equal(JSON.parse(await readFile(join(resultsDir, timeoutId, 'report.json'), 'utf8')).partial, true);
+
+    const runningTimeoutId = randomUUID();
+    t.after(() => rm(join(resultsDir, runningTimeoutId), { recursive: true, force: true }));
+    const runningTimeout = new AbortController();
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let sampleReported = () => {};
+    const sampleReady = new Promise<void>((resolve) => { sampleReported = resolve; });
+    t.after(() => clearTimeout(deadline));
+    answers.push(
+      { summary: 'Two claims', claims: [
+        { id: 'c1', claim: '30% less time', sourcePath: 'README.md', quote: 'Uses 30% less time.' },
+        { id: 'c2', claim: '30% less time', sourcePath: 'README.md', quote: 'Uses 30% less time.' }] },
+      { assessment: 'Fixture', project, experiments: [
+        { ...experiment, needsTaskData: false, claimId: 'c1', path: 'README.md', method: 'Read', reproduction: 'Fixture measurement',
+          benchmark: { runtime: 'python', network: false, command: `printf '%s\\n' 'REPROCHECK_PROGRESS {"task":"case-1","status":"completed","arms":{"baseline":1,"skill":2}}' >&2; sleep 30`,
+            metric: 'characters', unit: 'count', comparison: null, expected: null, basis: 'test fixture' } },
+        { ...experiment, needsTaskData: false, claimId: 'c2', path: 'README.md', method: 'Read', reproduction: 'No experiment' },
+      ] },
+    );
+    const running = investigate(app, 'https://github.com/owner/repo', runningTimeoutId, runningTimeout.signal, (stage) => {
+      if (stage === 'benchmark') deadline = setTimeout(() => runningTimeout.abort(new InvestigationTimeoutError()), 2000);
+    }, (stage, data) => {
+      if (stage === 'benchmark' && 'progressCount' in data) sampleReported();
+    });
+    await sampleReady;
+    let savedDuringRun: any;
+    for (let i = 0; i < 100; i++) {
+      try {
+        savedDuringRun = JSON.parse(await readFile(join(resultsDir, runningTimeoutId, 'benchmark.json'), 'utf8'));
+        if (savedDuringRun.runs[0]?.progress?.length) break;
+      } catch { /* asynchronous progress save has not completed yet */ }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(savedDuringRun.runs[0].status, 'running');
+    assert.deepEqual(savedDuringRun.runs[0].progress[0], { task: 'case-1', status: 'completed', arms: { baseline: 1, skill: 2 }, attempt: 1, unverified: true });
+    const runningPartial = await running;
+    assert.equal(runningPartial.partial, true);
+    assert.deepEqual(runningPartial.benchmark.runs.map((run) => run.status), ['interrupted', 'not_executed']);
+    const interrupted = JSON.parse(await readFile(join(resultsDir, runningTimeoutId, 'benchmark.json'), 'utf8'));
+    assert.match(interrupted.runs[0].attempts[0].result.stderr, /REPROCHECK_PROGRESS/);
+    assert.equal(interrupted.runs[0].progress[0].task, 'case-1');
   }
 
   const unmatchedId = randomUUID();

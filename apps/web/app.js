@@ -11,8 +11,8 @@ const stageInfo = {
   assessment: ['Prepare findings', 'Separating claims, observations, and unresolved questions.'],
 };
 const statuses = { evidence_only: 'Evidence only', unsupported: 'Unsupported', inconclusive: 'Inconclusive' };
-const runStatuses = { measured: 'Measured', not_runnable: 'Not runnable', failed: 'Execution failed', unavailable: 'Environment unavailable', invalid_output: 'Invalid output', retrying: 'Repairing and retrying' };
-const state = { controller: null, running: false, completed: false, cancelled: false, sessionId: '', current: '', stages: [], details: {}, runs: [], claims: [], report: null, reportUrl: '', error: '' };
+const runStatuses = { measured: 'Measured', running: 'Running', not_runnable: 'Not runnable', not_executed: 'Not executed', interrupted: 'Interrupted', failed: 'Execution failed', unavailable: 'Environment unavailable', invalid_output: 'Invalid output', retrying: 'Repairing and retrying' };
+const state = { controller: null, running: false, completed: false, partial: false, cancelled: false, sessionId: '', current: '', stages: [], details: {}, runs: [], claims: [], report: null, reportUrl: '', error: '' };
 
 function node(tag, className, text) {
   const element = document.createElement(tag);
@@ -78,14 +78,14 @@ function renderTimeline() {
   $('feed-empty').hidden = state.stages.length > 0 || !!state.error;
   state.stages.forEach((stage, index) => {
     const current = stage === state.current;
-    const kind = current && (state.error || state.cancelled) ? 'failed' : current && state.running && !state.completed ? 'active' : 'done';
+    const kind = current && (state.error || state.cancelled || state.partial) ? 'failed' : current && state.running && !state.completed ? 'active' : 'done';
     const li = node('li', `timeline-item ${kind}`);
     const marker = node('span', `timeline-marker${kind === 'active' ? ' spinner' : ''}`, kind === 'done' ? '✓' : kind === 'failed' ? '!' : kind === 'active' ? '' : String(index + 1).padStart(2, '0'));
     marker.setAttribute('aria-hidden', 'true');
     const content = node('div');
     const header = node('div', 'timeline-header');
     header.append(node('p', 'timeline-title', stageInfo[stage]?.[0] || stage), node('span', 'timeline-state',
-      kind === 'active' ? 'In progress' : kind === 'failed' ? (state.cancelled ? 'Stopped' : 'Incomplete') : 'Completed'));
+      kind === 'active' ? 'In progress' : kind === 'failed' ? (state.cancelled ? 'Stopped' : state.partial ? 'Timed out' : 'Incomplete') : 'Completed'));
     content.append(header);
     const description = stageInfo[stage]?.[1];
     if (description && kind === 'active') content.append(node('p', 'timeline-description', description));
@@ -94,7 +94,7 @@ function renderTimeline() {
     li.append(marker, content);
     timeline.append(li);
   });
-  $('feed-label').textContent = state.running ? 'Live' : state.completed ? 'Completed' : state.cancelled ? 'Stopped' : state.error ? 'Incomplete' : 'Waiting to start';
+  $('feed-label').textContent = state.partial ? 'Timed out' : state.running ? 'Live' : state.completed ? 'Completed' : state.cancelled ? 'Stopped' : state.error ? 'Incomplete' : 'Waiting to start';
   $('run-error').hidden = !state.error;
   $('run-error').textContent = state.error;
   if (follow) scroller.scrollTop = scroller.scrollHeight;
@@ -168,6 +168,12 @@ function renderResultCard(stage) {
         (run.attempts?.length || run.attemptsCount) > 1 && 'Retried once',
         run.matched === true ? 'Met the experiment threshold' : run.matched === false ? 'Did not meet the experiment threshold' : ''].filter(Boolean).join(' · ');
       const item = resultItem(run.claimId || 'Experiment', result, extra);
+      if (Array.isArray(run.progress) && run.progress.length) {
+        const progress = node('details', 'run-log');
+        progress.append(node('summary', '', `View ${run.progress.length} unverified sample records`));
+        for (const sample of run.progress) progress.append(node('pre', '', JSON.stringify(sample, null, 2)));
+        item.append(progress);
+      }
       const attempts = Array.isArray(run.attempts) ? run.attempts.map((attempt) => attempt.result) : [run];
       if (attempts.some((attempt) => attempt.stderr || attempt.stdout || attempt.error)) {
         const details = node('details', 'run-log');
@@ -191,6 +197,7 @@ function renderReport() {
   const wasHidden = $('report-panel').hidden;
   $('report-panel').hidden = !report;
   if (!report) return;
+  $('report-title').textContent = report.partial ? 'Partial investigation report' : 'Investigation report';
   $('report-summary').textContent = report.modelSummary || report.summary || 'The investigation has ended.';
   $('report-limitation').textContent = report.limitation || '';
   $('report-link').href = state.reportUrl;
@@ -219,12 +226,12 @@ function render() {
   $('submit-button').firstElementChild.textContent = state.running ? 'Running...' : 'Start';
   $('repo-url').readOnly = state.running;
   $('stop-button').hidden = !state.running;
-  $('run-status').dataset.state = state.error || state.cancelled ? 'error' : state.completed ? 'done' : 'running';
-  $('run-status-text').textContent = state.running ? 'Investigation in progress' : state.completed ? 'Investigation complete' : state.cancelled ? 'Investigation stopped' : state.error ? 'Investigation incomplete' : 'Preparing';
-  document.querySelector('.workspace-heading h2').firstChild.textContent = state.completed ? 'Investigation complete' : state.cancelled ? 'Investigation stopped' : state.error ? 'Investigation incomplete' : 'Investigation in progress';
+  $('run-status').dataset.state = state.error || state.cancelled || state.partial ? 'error' : state.completed ? 'done' : 'running';
+  $('run-status-text').textContent = state.partial ? 'Timed out · partial report' : state.running ? 'Investigation in progress' : state.completed ? 'Investigation complete' : state.cancelled ? 'Investigation stopped' : state.error ? 'Investigation incomplete' : 'Preparing';
+  document.querySelector('.workspace-heading h2').firstChild.textContent = state.partial ? 'Investigation timed out' : state.completed ? 'Investigation complete' : state.cancelled ? 'Investigation stopped' : state.error ? 'Investigation incomplete' : 'Investigation in progress';
   renderTimeline();
   renderReport();
-  $('results-label').textContent = state.running ? 'Live' : state.completed ? 'Completed' : state.cancelled ? 'Stopped' : state.error ? 'Incomplete' : 'Waiting for results';
+  $('results-label').textContent = state.partial ? 'Partial report' : state.running ? 'Live' : state.completed ? 'Completed' : state.cancelled ? 'Stopped' : state.error ? 'Incomplete' : 'Waiting for results';
 }
 
 function onEvent({ event, data }) {
@@ -248,6 +255,7 @@ function onEvent({ event, data }) {
   if (event === 'message' && typeof payload.text === 'string') state.summary = payload.text;
   if (event === 'done') {
     state.completed = true;
+    state.partial = payload.partial === true;
     state.summary = payload.finalResponse || state.summary;
     state.reportUrl = validReportUrl(payload.reportUrl);
   }
@@ -258,7 +266,7 @@ function onEvent({ event, data }) {
 
 async function startInvestigation(url) {
   const controller = new AbortController();
-  Object.assign(state, { controller, running: true, completed: false, cancelled: false, sessionId: '', current: '', stages: [], details: {}, runs: [], claims: [], report: null, reportUrl: '', error: '', summary: '' });
+  Object.assign(state, { controller, running: true, completed: false, partial: false, cancelled: false, sessionId: '', current: '', stages: [], details: {}, runs: [], claims: [], report: null, reportUrl: '', error: '', summary: '' });
   $('page').classList.add('active');
   document.querySelector('.topbar').append($('url-form'));
   $('investigation').hidden = false;
@@ -288,6 +296,7 @@ async function startInvestigation(url) {
       if (Array.isArray(value.metrics?.claims)) state.claims = value.metrics.claims;
       if (Array.isArray(value.benchmark?.runs)) {
         state.runs = value.benchmark.runs.map((run) => ({ ...run, metric: run.benchmark?.metric, unit: run.benchmark?.unit }));
+        if (state.runs.length && !state.details.benchmark) state.details.benchmark = {};
         renderResultCard('benchmark');
       }
     } catch (error) {

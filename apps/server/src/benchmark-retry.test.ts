@@ -1,9 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { runWithRetry } from './benchmark-retry.js';
+import { extractRepairCommand, runWithRetry, withRepairDeadline } from './benchmark-retry.js';
 import type { Benchmark } from './benchmark.js';
 
 const plan: Benchmark = { runtime: 'python', network: false, command: 'bad', metric: 'time', unit: 's', comparison: null, expected: null, basis: 'fixture' };
+
+test('accepts unambiguous repair formats and rejects conflicting commands', () => {
+  assert.equal(extractRepairCommand({ command: 'fixed' }), 'fixed');
+  assert.equal(extractRepairCommand({ benchmark: { command: 'fixed' } }), 'fixed');
+  assert.equal(extractRepairCommand({ experiment: { command: 'fixed' } }), 'fixed');
+  assert.equal(extractRepairCommand({ experiment: { benchmark: { command: 'fixed' } } }), 'fixed');
+  assert.equal(extractRepairCommand({ command: null }), null);
+  assert.throws(() => extractRepairCommand({ command: 'one', benchmark: { command: 'two' } }), /conflicting/);
+});
+
+test('closes an independent repair session when its deadline expires', async () => {
+  let closed = false;
+  await assert.rejects(withRepairDeadline(() => new Promise(() => {}), async () => { closed = true; }, new AbortController().signal, 20), /timed out/);
+  assert.equal(closed, true);
+});
 
 test('retains both attempts and only replaces the command', async () => {
   const seen: Benchmark[] = [];
@@ -23,10 +38,10 @@ test('retains both attempts and only replaces the command', async () => {
 
 test('does not retry unavailable environments and retains the original failure when repair is invalid', async () => {
   let repairs = 0;
-  const unavailable = await runWithRetry(plan, async () => ({ status: 'unavailable', error: 'no Docker' }), async () => { repairs++; return 'fixed'; });
+  const unavailable = await runWithRetry(plan, async () => ({ status: 'unavailable', error: 'no sandbox' }), async () => { repairs++; return 'fixed'; });
   assert.equal(unavailable.status, 'unavailable');
   assert.equal(repairs, 0);
-  const failed = await runWithRetry(plan, async () => ({ status: 'invalid_output', stdout: 'wrong', stderr: '', image: 'image', imageId: 'id', network: 'none', elapsedMs: 1, exitCode: 0, timedOut: false }), async () => null);
+  const failed = await runWithRetry(plan, async () => ({ status: 'invalid_output', stdout: 'wrong', stderr: '', environment: { platform: 'darwin', release: '', architecture: '', tools: {}, sandbox: { provider: 'dsh-local', mode: 'workspace-write', enforcement: 'full' as const }, network: 'host-unrestricted', networkRequested: false }, elapsedMs: 1, exitCode: 0, timedOut: false }), async () => null);
   assert.equal(failed.status, 'invalid_output');
   assert.match(failed.retryError!, /No modified executable command/);
   assert.equal(failed.attempts.length, 1);

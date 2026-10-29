@@ -50,20 +50,24 @@ test('investigation HTTP interface', async (t) => {
     assert.deepEqual(result.json(), { id, summary: 'saved' });
     assert.equal((await app.inject({ method: 'GET', url: '/investigations/not-an-id' })).statusCode, 404);
   });
-  await t.test('reports timeout after cancellation', async (t) => {
+  await t.test('does not impose an overall investigation deadline', async (t) => {
     let started = () => {};
+    let finish = () => {};
     const running = new Promise<void>((resolve) => { started = resolve; });
-    t.mock.method(app, 'investigate', async (_app, _url, _id, signal) => {
+    t.mock.method(app, 'investigate', async (_app, _url, id, signal) => {
       started();
-      return await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      await new Promise<void>((resolve) => { finish = resolve; });
+      assert.equal(signal.aborted, false);
+      return { id, summary: 'Finished' } as Awaited<ReturnType<typeof app.investigate>>;
     });
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const request = app.inject({ method: 'POST', url: '/investigations', payload: { url: 'https://github.com/owner/repo' } });
     await running;
-    t.mock.timers.tick(1800000);
+    t.mock.timers.tick(2 * 60 * 60_000);
+    finish();
     const response = await request;
-    assert.match(response.body, /"code":504/);
-    assert.doesNotMatch(response.body, /event: done/);
+    assert.match(response.body, /event: done/);
+    assert.doesNotMatch(response.body, /event: error/);
   });
   await t.test('cancels work when the client disconnects', { timeout: 5000 }, async (t) => {
     let aborted = () => {};

@@ -47,10 +47,8 @@ app.post<{ Body: { url: string } }>('/investigations', {
   const sessionId = randomUUID();
   const { raw } = reply;
   const controller = new AbortController();
-  const timeoutError = new Error('The investigation timed out.');
   const disconnectError = new Error('The client disconnected.');
   const disconnect = () => controller.abort(disconnectError);
-  const timer = setTimeout(() => controller.abort(timeoutError), 1800000);
   const send = (event: string, data: object) => {
     if (raw.destroyed || raw.writableEnded) return;
     if (raw.writableLength > 1024 * 1024) { raw.destroy(); return; }
@@ -65,15 +63,13 @@ app.post<{ Body: { url: string } }>('/investigations', {
       (stage) => send('progress', { sessionId, stage }), (stage, data) => send('detail', { sessionId, stage, data }));
     if (controller.signal.aborted) throw controller.signal.reason;
     send('message', { sessionId, text: report.summary });
-    send('done', { sessionId, finalResponse: report.summary, reportUrl: `/investigations/${sessionId}` });
+    send('done', { sessionId, finalResponse: report.summary, reportUrl: `/investigations/${sessionId}`, partial: report.partial === true });
   } catch (error) {
     if (controller.signal.reason !== disconnectError) {
-      const timedOut = controller.signal.reason === timeoutError;
-      request.log.error({ timedOut, errorType: error instanceof Error ? error.name : 'unknown' }, 'Investigation failed');
-      send('error', { message: timedOut ? timeoutError.message : 'The investigation failed.', code: timedOut ? 504 : 502 });
+      request.log.error({ errorType: error instanceof Error ? error.name : 'unknown' }, 'Investigation failed');
+      send('error', { message: 'The investigation failed.', code: 502 });
     }
   } finally {
-    clearTimeout(timer);
     raw.off('close', disconnect);
     if (!raw.destroyed && !raw.writableEnded) raw.end();
   }

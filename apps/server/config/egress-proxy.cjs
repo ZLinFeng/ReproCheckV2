@@ -83,11 +83,11 @@ function createProxy(model, targetResolver = resolveTarget) {
         const data = JSON.parse(body);
         if (!data || typeof data !== 'object' || Array.isArray(data) || data.model !== model.model) throw new Error('model denied');
         const base = new URL(model.baseUrl);
-        if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash) throw new Error('invalid model endpoint');
-        const target = await targetResolver(base.hostname);
-        const upstream = https.request({ hostname: target.address, family: target.family, servername: base.hostname,
-          port: base.port || 443, method: 'POST', path: `${base.pathname.replace(/\/$/, '')}/chat/completions`,
-          headers: { host: base.host, 'content-type': 'application/json', authorization: `Bearer ${model.key}` }, timeout: 180000 }, (result) => {
+        if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) throw new Error('invalid model endpoint');
+        const target = base.protocol === 'https:' ? await targetResolver(base.hostname) : { address: base.hostname.replace(/^\[|\]$/g, '') };
+        const upstream = (base.protocol === 'https:' ? https : http).request({ hostname: target.address, family: target.family, servername: base.hostname,
+          port: base.port || (base.protocol === 'https:' ? 443 : 80), method: 'POST', path: `${base.pathname.replace(/\/$/, '')}/chat/completions`,
+          headers: { host: base.host, 'content-type': 'application/json', authorization: `Bearer ${model.key}` }, timeout: 15 * 60_000 }, (result) => {
           response.writeHead(result.statusCode || 502, { 'content-type': result.headers['content-type'] || 'application/json' });
           result.pipe(response);
         });

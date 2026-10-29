@@ -6,6 +6,8 @@ export async function runProcess(command: string, args: string[], options: {
   signal?: AbortSignal;
   timeoutMs: number;
   maxBytes?: number;
+  onAbortOutput?: (output: { stdout: string; stderr: string }) => void;
+  onStderr?: (chunk: Buffer) => void;
 }) {
   if (options.signal?.aborted) throw options.signal.reason;
   return await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }>((resolve, reject) => {
@@ -31,7 +33,7 @@ export async function runProcess(command: string, args: string[], options: {
       bytes += chunk.length;
       if (bytes > (options.maxBytes ?? 1024 * 1024)) { exceeded = true; stop(); return; }
       if (stream === 'stdout') stdout.push(chunk);
-      else stderr.push(chunk);
+      else { stderr.push(chunk); options.onStderr?.(chunk); }
     };
     child.stdout.on('data', (chunk: Buffer) => collect('stdout', chunk));
     child.stderr.on('data', (chunk: Buffer) => collect('stderr', chunk));
@@ -40,7 +42,10 @@ export async function runProcess(command: string, args: string[], options: {
       clearTimeout(timer);
       clearTimeout(forceKill);
       options.signal?.removeEventListener('abort', abort);
-      if (options.signal?.aborted) return reject(options.signal.reason);
+      if (options.signal?.aborted) {
+        options.onAbortOutput?.({ stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') });
+        return reject(options.signal.reason);
+      }
       if (exceeded) return reject(new Error('Process output exceeded the limit.'));
       resolve({ code, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'), timedOut });
     });

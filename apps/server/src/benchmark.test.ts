@@ -1,14 +1,13 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
 import test from 'node:test';
 import { findPi, parseBenchmark, runBenchmark } from './benchmark.js';
+import { sandbox } from './sandbox.js';
 
 const benchmark = { runtime: 'python' as const, network: false, command: '', metric: 'example', unit: 'count', comparison: 'eq' as const, expected: 3, basis: 'fixture' };
-const dockerAvailable = spawnSync('docker', ['image', 'inspect', 'python:3.12-alpine'], { stdio: 'ignore', timeout: 5000 }).status === 0;
-const piAvailable = !!await findPi();
 
 test('validates executable plans', () => {
   assert.equal(parseBenchmark(null), null);
@@ -27,92 +26,117 @@ test('validates executable plans', () => {
   assert.throws(() => parseBenchmark({ ...benchmark, command: 'echo', expected: null }));
 });
 
-test('provides Pi in the isolated container without model credentials', { skip: !dockerAvailable || !piAvailable, timeout: 30000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'reprocheck-pi-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const result = await runBenchmark(root, { ...benchmark, runtime: 'node', network: true, agent: true, expected: 1,
-    command: `pi --version >&2 && node -e 'if(process.env.REPROCHECK_MODEL_API_KEY)process.exit(1); console.log(JSON.stringify({value:1}))'` });
-  assert.equal(result.status, 'measured', JSON.stringify(result));
-  if (result.status === 'measured') assert.equal(result.agent?.name, 'pi');
-});
-
-test('runs a real offline measurement with an isolated writable copy', { skip: !dockerAvailable, timeout: 30000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'reprocheck-benchmark-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+test('runs the host runtime through the DSH sandbox in a temporary copy', { skip: process.platform !== 'darwin' && process.platform !== 'linux', timeout: 30000 }, async (t) => {
+  const parent = await mkdtemp(join(process.cwd(), 'reprocheck-test-'));
+  const root = join(parent, 'source');
+  await mkdir(root);
+  const outside = join(parent, 'outside.txt');
   await writeFile(join(root, 'data.txt'), 'abc');
-  const command = `python -c 'import json, pathlib, socket; p=pathlib.Path("data.txt"); n=len(p.read_text()); p.write_text("changed"); s=socket.socket(); s.settimeout(1); assert s.connect_ex(("1.1.1.1", 80)) != 0; print(json.dumps({"value": n}))'`;
-  const result = await runBenchmark(root, { ...benchmark, command });
-  assert.equal(result.status, 'measured');
-  if (result.status === 'measured') {
-    assert.equal(result.actual, 3);
-    assert.equal(result.matched, true);
-  }
-  const exploratory = await runBenchmark(root, { ...benchmark, command, comparison: null, expected: null });
-  assert.equal(exploratory.status, 'measured');
-  if (exploratory.status === 'measured') {
-    assert.equal(exploratory.actual, 3);
-    assert.equal(exploratory.matched, null);
-  }
+  await writeFile(outside, 'protected');
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  const command = `node -e 'const fs=require("fs"),cp=require("child_process");const p="data.txt";const n=fs.readFileSync(p,"utf8").length;fs.writeFileSync(p,"changed");const child=cp.spawnSync(process.execPath,["-e", ${JSON.stringify('require("fs").writeFileSync(process.argv[1],"bad")')},${JSON.stringify(outside)}]);if(child.status===0)process.exit(2);console.log(JSON.stringify({value:n,workspace:process.env.REPROCHECK_WORKSPACE}))'`;
+  const result = await runBenchmark(root, { ...benchmark, runtime: 'node', command });
+  assert.equal(result.status, 'measured', JSON.stringify(result));
+  if (result.status !== 'measured') return;
+  assert.equal(result.actual, 3);
+  assert.equal(result.matched, true);
+  assert.equal(result.environment.sandbox.provider, 'dsh-local');
+  assert.equal(result.environment.network, 'host-unrestricted');
   assert.equal(await readFile(join(root, 'data.txt'), 'utf8'), 'abc');
-  const longCommand = `#${'x'.repeat(16000 - command.length - 2)}\n${command}`;
-  const longResult = await runBenchmark(root, parseBenchmark({ ...benchmark, command: longCommand })!);
-  assert.equal(longResult.status, 'measured', JSON.stringify(longResult));
-  const invalid = await runBenchmark(root, { ...benchmark, command: 'echo not-json' });
-  assert.equal(invalid.status, 'invalid_output');
-  const failed = await runBenchmark(root, { ...benchmark, command: 'exit 7' });
+  assert.equal(await readFile(outside, 'utf8'), 'protected');
+  await assert.rejects(stat(JSON.parse(result.stdout).workspace), { code: 'ENOENT' });
+
+  const failed = await runBenchmark(root, { ...benchmark, runtime: 'node', command: 'exit 7' });
   assert.equal(failed.status, 'failed');
   if (failed.status === 'failed' && 'exitCode' in failed) assert.equal(failed.exitCode, 7);
-  const malformed = await runBenchmark(root, { ...benchmark, command: 'if true; then' });
-  assert.equal(malformed.status, 'failed');
-  if (malformed.status === 'failed' && 'stderr' in malformed) assert.match(malformed.stderr, /syntax error/i);
-  const installFailed = await runBenchmark(root, { ...benchmark, command: 'python -m pip install --no-index definitely-not-a-real-package-reprocheck >&2' });
-  assert.equal(installFailed.status, 'failed');
-  if (installFailed.status === 'failed' && 'stderr' in installFailed) assert.match(installFailed.stderr, /definitely-not-a-real-package-reprocheck/);
-  const before = spawnSync('docker', ['ps', '-a', '--filter', 'name=reprocheck-', '--format', '{{.Names}}'], { encoding: 'utf8' }).stdout.trim().split('\n');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('cancelled')), 1000);
-  try {
-    await assert.rejects(runBenchmark(root, { ...benchmark, command: 'sleep 30' }, controller.signal), /cancelled/);
-  } finally {
-    clearTimeout(timer);
-  }
-  const containers = spawnSync('docker', ['ps', '-a', '--filter', 'name=reprocheck-', '--format', '{{.Names}}'], { encoding: 'utf8' });
-  assert.ok(containers.stdout.trim().split('\n').every((name) => !name || before.includes(name)));
+  const invalid = await runBenchmark(root, { ...benchmark, runtime: 'node', command: 'echo not-json' });
+  assert.equal(invalid.status, 'invalid_output');
+  const exploratory = await runBenchmark(root, { ...benchmark, runtime: 'node', command: `echo '{"value":3}'`, comparison: null, expected: null });
+  assert.equal(exploratory.status, 'measured');
+  if (exploratory.status === 'measured') assert.equal(exploratory.matched, null);
 });
 
-test('copies a repository larger than the old limit and allows dependency-sized file counts', { skip: !dockerAvailable, timeout: 30000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'reprocheck-large-repo-test-'));
+test('does not pass host proxy settings to experiments', { skip: process.platform !== 'darwin' && process.platform !== 'linux', timeout: 30000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'reprocheck-direct-network-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const file = join(root, 'large-file');
-  await writeFile(file, '');
-  await truncate(file, 160 * 1024 * 1024);
-  const command = `python -c 'import json, pathlib; p=pathlib.Path("large-file"); d=pathlib.Path("deps"); d.mkdir(); [(d / str(i)).touch() for i in range(8500)]; print(json.dumps({"value":p.stat().st_size}))'`;
-  const result = await runBenchmark(root, { ...benchmark, command, expected: 160 * 1024 * 1024 });
+  const names = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
+  const previous = names.map((name) => process.env[name]);
+  t.after(() => names.forEach((name, index) => {
+    if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index];
+  }));
+  names.forEach((name) => { process.env[name] = 'http://127.0.0.1:7890'; });
+  const command = `node -e 'const names=["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy"];console.log(JSON.stringify({value:names.every(n=>!process.env[n])&&process.env.NO_PROXY==="*"&&process.env.no_proxy==="*"?1:0}))'`;
+  const result = await runBenchmark(root, { ...benchmark, runtime: 'node', network: true, command, expected: 1 });
   assert.equal(result.status, 'measured', JSON.stringify(result));
   if (result.status === 'measured') assert.equal(result.matched, true);
 });
 
-test('installs Python and Node dependencies through the public-only proxy',
-  { skip: !dockerAvailable || process.env.REPROCHECK_ONLINE_TEST !== '1', timeout: 300000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'reprocheck-online-test-'));
+test('reports progress and cleans up after cancellation', { skip: process.platform !== 'darwin' && process.platform !== 'linux', timeout: 15000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'reprocheck-benchmark-test-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const before = spawnSync('docker', ['ps', '-a', '--filter', 'name=reprocheck-', '--format', '{{.Names}}'], { encoding: 'utf8' }).stdout.trim().split('\n');
-  const networksBefore = spawnSync('docker', ['network', 'ls', '--filter', 'name=reprocheck-', '--format', '{{.Name}}'], { encoding: 'utf8' }).stdout.trim().split('\n');
-  const python = `python -c 'import http.client, socket; c=http.client.HTTPConnection("egress",3128,timeout=5); c.request("GET","http://169.254.169.254/"); assert c.getresponse().status==403; s=socket.socket(); s.settimeout(2); assert s.connect_ex(("1.1.1.1",80)) != 0; assert socket.getaddrinfo("egress",3128)' && if python -c 'import socket; socket.getaddrinfo("pypi.org",80)' 2>/dev/null; then exit 9; fi && python -m pip install --disable-pip-version-check --no-cache-dir --target /work/deps idna==3.10 >&2 && python -c 'import json,sys; sys.path.insert(0,"/work/deps"); import idna; print(json.dumps({"value":len(idna.__version__)}))'`;
-  const pythonResult = await runBenchmark(root, { ...benchmark, network: true, expected: 4, command: python });
-  assert.equal(pythonResult.status, 'measured', JSON.stringify(pythonResult));
-  if (pythonResult.status === 'measured') assert.equal(pythonResult.matched, true);
-  const nodeResult = await runBenchmark(root, { ...benchmark, runtime: 'node', network: true, expected: 1,
-    command: `npm install --prefix /work --no-audit --no-fund --ignore-scripts is-number@7.0.0 >&2 && node -e 'console.log(JSON.stringify({value:require("/work/node_modules/is-number")("3")?1:0}))'` });
-  assert.equal(nodeResult.status, 'measured', JSON.stringify(nodeResult));
-  if (nodeResult.status === 'measured') assert.equal(nodeResult.matched, true);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('cancelled online')), 2500);
-  try {
-    await assert.rejects(runBenchmark(root, { ...benchmark, network: true, command: 'sleep 30' }, controller.signal), /cancelled online/);
-  } finally { clearTimeout(timer); }
-  const containers = spawnSync('docker', ['ps', '-a', '--filter', 'name=reprocheck-', '--format', '{{.Names}}'], { encoding: 'utf8' });
-  assert.ok(containers.stdout.trim().split('\n').every((name) => !name || before.includes(name)));
-  const networks = spawnSync('docker', ['network', 'ls', '--filter', 'name=reprocheck-', '--format', '{{.Name}}'], { encoding: 'utf8' });
-  assert.ok(networks.stdout.trim().split('\n').every((name) => !name || networksBefore.includes(name)));
+  let interruptedLog = '';
+  let observedWorkspace = '';
+  const command = `printf 'workspace=%s\\n' "$REPROCHECK_WORKSPACE" >&2; printf '%s\\n' 'REPROCHECK_PROGRESS {"task":"one","status":"completed"}' >&2; sleep 30`;
+  const result = runBenchmark(root, { ...benchmark, runtime: 'node', command }, controller.signal, undefined, true,
+    (output) => { interruptedLog = output.stderr; }, () => controller.abort(new Error('cancelled')));
+  await assert.rejects(result, /cancelled/);
+  observedWorkspace = /workspace=([^\n]+)/.exec(interruptedLog)?.[1] || '';
+  assert.ok(observedWorkspace);
+  await assert.rejects(stat(observedWorkspace), { code: 'ENOENT' });
+});
+
+
+test('uses the host Pi with temporary model configuration and a local gateway', { skip: !(await findPi()), timeout: 30000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'reprocheck-pi-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const script = `const fs=require("fs"),http=require("http");const c=JSON.parse(fs.readFileSync(process.env.PI_CODING_AGENT_DIR+"/models.json"));if(c.providers.reprocheck.apiKey!=="local"||process.env.REPROCHECK_MODEL_API_KEY!=="local"||JSON.stringify(process.env).includes("secret-test-key"))process.exit(2);const r=http.request(process.env.REPROCHECK_MODEL_BASE_URL+"/chat/completions",{method:"POST"},res=>{res.resume();res.on("end",()=>console.log(JSON.stringify({value:res.statusCode}))) });r.on("error",()=>process.exit(3));r.end(JSON.stringify({model:"wrong"}));`;
+  const result = await runBenchmark(root, { ...benchmark, runtime: 'node', network: true, agent: true, model: true, expected: 403,
+    command: `pi --version >&2 && node -e '${script}'` }, undefined,
+    { baseUrl: 'https://example.com/v1', key: 'secret-test-key', model: 'test-model' });
+  assert.equal(result.status, 'measured', JSON.stringify(result));
+  if (result.status === 'measured') {
+    assert.equal(result.matched, true);
+    assert.equal(result.agent?.name, 'pi');
+    assert.equal(result.model, 'test-model');
+    assert.ok(!JSON.stringify(result).includes('secret-test-key'));
+  }
+});
+
+test('uses the configured private HTTP model endpoint through the model gateway', { skip: process.platform !== 'darwin' && process.platform !== 'linux', timeout: 30000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'reprocheck-model-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const upstream = createServer((request, response) => {
+    assert.equal(request.url, '/v1/chat/completions');
+    assert.equal(request.headers.authorization, 'Bearer secret-test-key');
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{"value":3}');
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => upstream.close(() => resolve())));
+  const port = (upstream.address() as { port: number }).port;
+  const command = `node -e 'const http=require("http");const r=http.request(process.env.REPROCHECK_MODEL_BASE_URL+"/chat/completions",{method:"POST"},res=>res.pipe(process.stdout));r.on("error",()=>process.exit(1));r.end(JSON.stringify({model:"test-model"}))'`;
+  const result = await runBenchmark(root, { ...benchmark, runtime: 'node', network: true, model: true, command }, undefined,
+    { baseUrl: `http://127.0.0.1:${port}/v1`, key: 'secret-test-key', model: 'test-model' });
+  assert.equal(result.status, 'measured', JSON.stringify(result));
+  if (result.status === 'measured') assert.equal(result.actual, 3);
+  assert.ok(!JSON.stringify(result).includes('secret-test-key'));
+});
+
+test('online search proxy rejects local destinations', { timeout: 30000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'reprocheck-search-proxy-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const command = `python -c 'import json,urllib.request,urllib.error;\ntry: urllib.request.urlopen("http://127.0.0.1:9/", timeout=5)\nexcept urllib.error.HTTPError as e: print(json.dumps({"value":e.code}))'`;
+  const result = await runBenchmark(root, { ...benchmark, network: true, command, expected: 403 }, undefined, undefined, false, undefined, undefined, true);
+  assert.equal(result.status, 'measured', JSON.stringify(result));
+  if (result.status === 'measured') assert.equal(result.matched, true);
+});
+
+
+test('fails closed when the DSH sandbox is unavailable', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'reprocheck-unavailable-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  t.mock.method(sandbox, 'confine', async () => { throw Object.assign(new Error('unavailable'), { code: 'SANDBOX_UNAVAILABLE' }); });
+  const result = await runBenchmark(root, { ...benchmark, runtime: 'node', command: `echo '{"value":3}'` });
+  assert.equal(result.status, 'unavailable');
 });
