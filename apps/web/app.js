@@ -1,4 +1,5 @@
 import { readSSE } from './sse.js';
+import { metricSummary } from './metric-summary.js';
 
 const $ = (id) => document.getElementById(id);
 const stageInfo = {
@@ -204,14 +205,23 @@ function renderReport() {
   $('report-link').hidden = !state.reportUrl;
   const container = $('findings');
   container.replaceChildren();
-  const findings = Array.isArray(report.findings) ? report.findings : [];
-  for (const finding of findings) {
-    const claim = state.claims.find((item) => item.id === finding.claimId);
+  const findings = metricSummary(report);
+  for (const { finding, claim, run, sample } of findings) {
     const row = node('article', 'finding');
     const status = node('span', 'finding-status', statuses[finding.status] || 'Inconclusive');
     status.dataset.status = finding.status || 'inconclusive';
     const body = node('div');
     body.append(node('h4', 'finding-title', claim?.claim || finding.claimId || 'Finding'));
+    if (run) {
+      const measured = run.status === 'measured' && typeof run.actual === 'number' && Number.isFinite(run.actual)
+        ? `: ${run.actual}${run.benchmark?.unit ? ` ${run.benchmark.unit}` : ''}` : '';
+      const metric = run.benchmark?.metric ? ` · ${run.benchmark.metric}` : '';
+      const threshold = run.status === 'measured' && run.matched === true ? ' · Met experiment threshold' :
+        run.status === 'measured' && run.matched === false ? ' · Did not meet experiment threshold' : '';
+      body.append(node('p', 'finding-metric', `${runStatuses[run.status] || run.status}${measured}${metric}${threshold}`));
+      if (sample) body.append(node('p', 'finding-next', sample));
+      if (run.status !== 'measured' && (run.reason || run.error)) body.append(node('p', 'finding-next', run.reason || run.error));
+    }
     if (finding.explanation) body.append(node('p', 'finding-explanation', finding.explanation));
     if (finding.nextStep) body.append(node('p', 'finding-next', `Next step: ${finding.nextStep}`));
     row.append(status, body);
@@ -334,3 +344,28 @@ $('repo-url').addEventListener('input', () => {
   $('input-error').textContent = '';
 });
 $('stop-button').addEventListener('click', () => state.controller?.abort());
+
+const savedReportUrl = validReportUrl(new URLSearchParams(location.search).get('report'));
+if (savedReportUrl) {
+  void (async () => {
+    $('page').classList.add('active');
+    document.querySelector('.topbar').append($('url-form'));
+    $('investigation').hidden = false;
+    try {
+      const response = await fetch(savedReportUrl);
+      if (!response.ok) throw new Error('Could not load the report.');
+      const report = await response.json();
+      if (!Array.isArray(report.findings)) throw new Error('The report is not complete.');
+      Object.assign(state, { report, reportUrl: savedReportUrl, completed: true, partial: report.partial === true,
+        claims: Array.isArray(report.metrics?.claims) ? report.metrics.claims : [],
+        runs: Array.isArray(report.benchmark?.runs) ? report.benchmark.runs : [] });
+      const url = report.source?.url || '';
+      $('repo-name').textContent = validRepository(url) ? new URL(url).pathname.slice(1).replace(/\.git$/i, '') : 'Saved investigation';
+      $('repo-display').textContent = url;
+      if (state.runs.length) { state.details.benchmark = {}; renderResultCard('benchmark'); }
+    } catch (error) {
+      state.error = error instanceof Error ? error.message : 'Could not load the report.';
+    }
+    render();
+  })();
+}

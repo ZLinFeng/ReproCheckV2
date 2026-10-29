@@ -16,6 +16,7 @@ test('investigation HTTP interface', async (t) => {
     const script = await app.inject({ method: 'GET', url: '/app.js' });
     assert.equal(script.statusCode, 200);
     assert.match(script.headers['content-type'] as string, /javascript/);
+    assert.equal((await app.inject({ method: 'GET', url: '/metric-summary.js' })).statusCode, 200);
   });
   await t.test('rejects non-repository URLs and extra input', async () => {
     for (const body of [{}, { url: 'http://github.com/a/b' }, { url: 'https://github.com/a/b/issues' },

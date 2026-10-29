@@ -27,6 +27,7 @@ for (const [route, file, type] of [
   ['/', 'index.html', 'text/html; charset=utf-8'],
   ['/app.js', 'app.js', 'text/javascript; charset=utf-8'],
   ['/sse.js', 'sse.js', 'text/javascript; charset=utf-8'],
+  ['/metric-summary.js', 'metric-summary.js', 'text/javascript; charset=utf-8'],
   ['/styles.css', 'styles.css', 'text/css; charset=utf-8'],
 ] as const) {
   app.get(route, async (_request, reply) => {
