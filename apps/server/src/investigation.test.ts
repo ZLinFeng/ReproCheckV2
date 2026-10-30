@@ -445,3 +445,42 @@ test('retries a plan that fails validation, such as a merged claim id', async (t
   assert.match(await readFile(join(resultsDir, id, 'model-plan.txt'), 'utf8'), /c1,c7,c8/);
   assert.match(await readFile(join(resultsDir, id, 'model-plan-2.txt'), 'utf8'), /"claimId":"c1"/);
 });
+
+test('retries a plan that blocks on a third-party CLI or API key', async (t) => {
+  await app.ready();
+  t.after(() => app.close());
+  const fakeBin = await mkdtemp(join(tmpdir(), 'reprocheck-fake-git-'));
+  const git = join(fakeBin, 'git');
+  await writeFile(git, `#!/bin/sh\ncase "$*" in\n  *clone*) for last; do :; done; /bin/mkdir -p "$last"; printf 'Saves 20%% tokens with Claude.\\n' > "$last/README.md";;\n  *rev-parse*) printf '0123456789012345678901234567890123456789\\n';;\nesac\n`);
+  await chmod(git, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${oldPath || '/usr/local/bin:/usr/bin:/bin'}`;
+  const id = randomUUID();
+  t.after(async () => {
+    process.env.PATH = oldPath;
+    await rm(fakeBin, { recursive: true, force: true });
+    await rm(join(resultsDir, id), { recursive: true, force: true });
+  });
+  const benchmark = { runtime: 'python', network: true, model: true, metric: 'tokens', unit: 'count', comparison: null, expected: null, basis: 'fixture' };
+  const answers: unknown[] = [
+    { summary: 'One claim', claims: [{ id: 'c1', claim: '20% fewer tokens', sourcePath: 'README.md', quote: 'Saves 20% tokens with Claude.' }] },
+    { assessment: 'Needs Anthropic', project, experiments: [{ ...experiment, claimId: 'c1', path: 'README.md', method: 'Read', reproduction: 'Count tokens with the Anthropic tokenizer',
+      blockedReason: 'Requires Anthropic API key to access Claude\'s tokenizer; not provided.' }] },
+    { assessment: 'Substituted with Pi', project, experiments: [{ ...experiment, claimId: 'c1', path: 'README.md', method: 'Read', reproduction: 'Count tokens with the Pi-configured model',
+      benchmark }] },
+    `python -c 'import json; print(json.dumps({"value": 20}))'`,
+    { summary: 'Fixture only', findings: [{ claimId: 'c1', status: 'inconclusive', explanation: 'Substituted model', nextStep: 'Check thresholds.' }] },
+  ];
+  const prompts: string[] = [];
+  t.mock.method(app, 'searchOnline', async () => ({ searches: [], sources: [], errors: [] }));
+  t.mock.method(app, 'createWebHarness', async () => ({
+    harness: { run: async (prompt: string) => { prompts.push(prompt); const next = answers.shift();
+      return { finalResponse: typeof next === 'string' ? next : JSON.stringify(next) ?? '' }; } },
+    close: async () => {},
+  } as unknown as Awaited<ReturnType<typeof app.createWebHarness>>));
+  const report = await investigate(app, 'https://github.com/owner/repo', id, new AbortController().signal, () => {});
+  assert.match(prompts.find((prompt) => prompt.includes('validationError')) ?? '', /缺少第三方 CLI/);
+  assert.equal(report.plan.experiments[0].blockedReason, null);
+  assert.equal(report.plan.experiments[0].benchmark?.network, true);
+  assert.equal(report.benchmark.runs[0].status, 'measured');
+});

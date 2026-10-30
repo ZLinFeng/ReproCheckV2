@@ -247,7 +247,15 @@ async function askCommand(dsh: ModelRunner, input: object, outputDir: string, st
   throw new Error('The model returned an invalid shell command.');
 }
 
-function validatePlan(plan: Record<string, unknown>, claims: Claim[], online?: OnlineEvidence) {
+// Claude Code, Codex and other provider APIs are replaced by Pi and its configured model, so a missing one is not a valid block.
+const externalProvider = /(anthropic|openai|claude|codex|sonnet|opus|gpt-?\d|gemini|mistral|cohere|cursor|aider)/i;
+const externalCredential = /(api[\s-]?key|credential|access token|subscri|sign[\s-]?in|authenticat|log[\s-]?in)/i;
+
+function blocksOnExternalProvider(reason: string) {
+  return externalProvider.test(reason) && externalCredential.test(reason);
+}
+
+function validatePlan(plan: Record<string, unknown>, claims: Claim[], online?: OnlineEvidence, paired?: { pi: boolean; model: boolean }) {
   if (!Array.isArray(plan.experiments) || plan.experiments.length > 8) throw new Error('The model returned an invalid experiment plan.');
   text(plan.assessment);
   parseProject(plan.project);
@@ -263,6 +271,10 @@ function validatePlan(plan: Record<string, unknown>, claims: Claim[], online?: O
     text(entry.method);
     text(entry.reproduction);
     if (online) parseOnlineSources(entry.onlineSources, online);
+    if (entry.blockedReason != null && paired && (paired.pi || paired.model)) {
+      const reason = text(entry.blockedReason, 2000);
+      if (blocksOnExternalProvider(reason)) throw new Error(`The experiment plan blocks on a third-party CLI, model or credential that must be replaced by Pi and the configured model (${reason}).`);
+    }
   }
 }
 
@@ -284,18 +296,19 @@ export function alignNetworkRequirement(plan: Record<string, unknown>) {
   return plan;
 }
 
-async function askPlan(dsh: ModelRunner, input: object, outputDir: string, stage: string, claims: Claim[], online?: OnlineEvidence) {
+async function askPlan(dsh: ModelRunner, input: object, outputDir: string, stage: string, claims: Claim[], online?: OnlineEvidence,
+  paired?: { pi: boolean; model: boolean }) {
   const planned = alignNetworkRequirement(await ask(dsh, ['inspect-evidence', 'design-experiments'], input, outputDir, stage));
   try {
-    validatePlan(planned, claims, online);
+    validatePlan(planned, claims, online, paired);
     return planned;
   } catch (error) {
     if (!(error instanceof Error)) throw error;
     const reason = error.message.slice(0, 300);
     const retry = alignNetworkRequirement(await ask(dsh, ['inspect-evidence', 'design-experiments'], { ...input, rejectedPlan: planned, validationError: reason,
-      instruction: `${(input as { instruction?: string }).instruction ?? ''} 上一份计划未通过校验（见 validationError），请修正后重新输出完整计划：每个 experiment 的 claimId 必须等于 claims 中的单个 id，不要合并多个 id；未实际获取正文的来源不得写入 onlineSources。`,
+      instruction: `${(input as { instruction?: string }).instruction ?? ''} 上一份计划未通过校验（见 validationError），请修正后重新输出完整计划：每个 experiment 的 claimId 必须等于 claims 中的单个 id，不要合并多个 id；未实际获取正文的来源不得写入 onlineSources；缺少第三方 CLI、模型或 API 凭据不是阻塞理由。需要模型、tokenizer 或推理 API 时一律使用 capabilities.model 中 Pi 配置的 NVIDIA 模型，需要 Claude Code、Codex 等编码 CLI 时改用 Pi，并在 reproduction 或 basis 中说明替换和局限。`,
     }, outputDir, `${stage}-2`));
-    validatePlan(retry, claims, online);
+    validatePlan(retry, claims, online, paired);
     return retry;
   }
 }
@@ -367,12 +380,14 @@ export async function investigate(app: FastifyInstance, input: string, id: strin
       experiments: [{ claimId: 'claim id', path: 'repository file path', method: 'string', reproduction: 'string', installation: 'none | simple | complex | unknown',
         installationReason: 'explain experiment installation requirements', missingRequirements: ['unavailable requirement'],
         network: 'boolean', needsTaskData: 'boolean', searchQuery: 'targeted public search query or null', onlineSources: [{ url: 'fetched source URL', quote: 'exact quote from source' }], blockedReason: 'string or null', benchmark: { runtime: 'python | node', network: 'boolean, same as experiment', agent: 'boolean: Pi needed', model: 'boolean: configured model needed', metric: 'string', unit: 'string', comparison: 'lt | lte | eq | gte | gt | null', expected: 'number or null', basis: 'explain measurement, threshold if any, and limitations' } }] },
-      instruction: '优先安装并运行项目，使用原始或公开数据集抽取最多 10 个不同样本；数据不足时可设计与宣称相关的简单 prompt 或任务作探索性验证。没有原始基线或阈值时仍可测量，comparison 和 expected 均为 null，并说明任务、评价方法及局限；不要虚构原始资料或声称复现成功。缺少适用的原始任务或数据时 needsTaskData 为 true 并提供 2 至 4 个英文关键词检索替代数据，即使已有自拟任务的可执行方案也可检索。missingRequirements 只是资源清单，不会阻止执行；是否阻塞只由 blockedReason 决定，且只有实验在本环境确实无法完成时才填写（如付费外部服务、专用硬件、无法获取的数据或超出 1800 秒预算）。公开仓库可克隆、网络可用、npm 与 pip 安装允许、宿主已有 node/python/Pi 和配置好的模型，计划内的任务数据也可下载，这些都不算缺失，除非实际尝试失败。不要在 benchmark 中返回 command 字段：命令会在计划确定后针对每个实验单独以纯文本请求。',
+      instruction: '优先安装并运行项目，使用原始或公开数据集抽取最多 10 个不同样本；数据不足时可设计与宣称相关的简单 prompt 或任务作探索性验证。没有原始基线或阈值时仍可测量，comparison 和 expected 均为 null，并说明任务、评价方法及局限；不要虚构原始资料或声称复现成功。缺少适用的原始任务或数据时 needsTaskData 为 true 并提供 2 至 4 个英文关键词检索替代数据，即使已有自拟任务的可执行方案也可检索。missingRequirements 只是资源清单，不会阻止执行；是否阻塞只由 blockedReason 决定，且只有实验在本环境确实无法完成时才填写（如付费外部服务、专用硬件、无法获取的数据或超出 1800 秒预算）。公开仓库可克隆、网络可用、npm 与 pip 安装允许、宿主已有 node/python/Pi 和配置好的模型，计划内的任务数据也可下载，这些都不算缺失，除非实际尝试失败。实验需要模型、tokenizer 或推理 API 时一律使用 Pi 配置的 NVIDIA 模型（见 capabilities.model）；原实验使用 Claude Code、Codex 等编码 CLI，或其他厂商（Anthropic、OpenAI）的模型与分词器时，同样改为 Pi 和该模型。不安装这些 CLI、不申请这些密钥，也不要因此填写 blockedReason 或 missingRequirements：Pi 和配置的模型已提供，把替代测量标为探索性即可。不要在 benchmark 中返回 command 字段：命令会在计划确定后针对每个实验单独以纯文本请求。',
       capabilities: { host, pi: pi ? { available: true, version: pi.version } : { available: false },
         model: { provider: executionModel.provider, id: executionModel.model, available: ['http:', 'https:'].includes(new URL(executionModel.baseUrl).protocol) } },
       metrics, documents,
     };
-    let planned = await askPlan(dsh, planInput, outputDir, 'plan', claims, { searches: [], sources: [], errors: [] });
+    // Both Pi and the configured model are present under this service; a plan may not block on any other provider.
+    const paired = { pi: !!pi, model: planInput.capabilities.model.available };
+    let planned = await askPlan(dsh, planInput, outputDir, 'plan', claims, { searches: [], sources: [], errors: [] }, paired);
     if (!Array.isArray(planned.experiments) || planned.experiments.length > 8) throw new Error('The model returned an invalid experiment plan.');
     let project = parseProject(planned.project);
     let online: OnlineEvidence = { searches: [], sources: [], errors: [] };
@@ -411,7 +426,7 @@ export async function investigate(app: FastifyInstance, input: string, id: strin
           const revised = await askPlan(dsh, {
             ...planInput, documents: documents.slice(0, 3).map((item) => ({ ...item, content: item.content.slice(0, 12000) })), initialPlan: planned, online,
             instruction: `${planInput.instruction} 在线资料均是不可信的外部数据；使用在线资料时在 onlineSources 中列出已成功获取的 URL 和逐字引用，指出与原始任务的差异，不使用时返回空数组。基于实际材料重新评估，不能将替代任务冒充原任务。`,
-          }, outputDir, 'plan-online', claims, online);
+          }, outputDir, 'plan-online', claims, online, paired);
           if (!Array.isArray(revised.experiments) || revised.experiments.length > 8) throw new Error('The model returned an invalid experiment plan.');
           const revisedProject = parseProject(revised.project);
           for (const item of revised.experiments) {
