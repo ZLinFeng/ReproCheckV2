@@ -21,7 +21,7 @@
 pnpm --filter @reprocheck/server dev
 ```
 
-启动后访问 `http://127.0.0.1:3000/` 使用 Web 界面。页面与 API 由同一个服务提供，不需要单独启动前端或配置跨域。
+服务监听 `0.0.0.0:3000`，本机可访问 `http://127.0.0.1:3000/` 使用 Web 界面，其他设备可通过宿主机 IP 访问。页面与 API 由同一个服务提供，不需要单独启动前端或配置跨域。
 
 如果获取 GitHub 仓库需要 HTTP(S) 代理，可在启动时设置 `REPROCHECK_GIT_PROXY`，例如 `REPROCHECK_GIT_PROXY=http://127.0.0.1:7688 pnpm --filter @reprocheck/server dev`。该代理只用于获取固定的 GitHub 仓库，不传给模型的网页工具。
 
@@ -68,4 +68,4 @@ pnpm --filter @reprocheck/server test
 
 如需验证实际联网搜索，可运行 `REPROCHECK_ONLINE_TEST=1 pnpm --filter @reprocheck/server test`；测试会访问公开搜索服务。
 
-接口目前没有鉴权，只适合本机可信调用。模型调用有费用，当前没有费用预算。DSH 本地沙箱共享宿主环境，对不可信仓库应使用专用隔离机器。
+接口目前没有鉴权，监听所有网络接口时可被能访问该端口的设备调用；请仅在可信网络中使用并通过防火墙限制访问。模型调用有费用，当前没有费用预算。DSH 本地沙箱共享宿主环境，对不可信仓库应使用专用隔离机器。
