@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import Fastify from 'fastify';
 import { stringify } from 'yaml';
-import { modelsPlugin, parseModelsConfig, resolveModel } from './models.js';
+import { modelsPlugin, parseModelsConfig, resolveExecutionModel, resolveModel } from './models.js';
 
 const first = { baseUrl: 'https://first.example.com/v1', key: 'first-secret', models: ['model-a', 'model-b'] };
 const second = { baseUrl: 'https://second.example.com/v1', key: 'second-secret', models: ['model-c'] };
@@ -62,6 +62,26 @@ test('resolves limits for the selected model', () => {
     first: { ...first, modelLimits: { 'model-a': limits } },
   } }));
   assert.deepEqual(resolveModel(models).limits, limits);
+});
+
+test('falls back to the default model for execution when none is configured', () => {
+  const models = parseModelsConfig(stringify(config));
+  assert.deepEqual(models.execution, config.default);
+  assert.deepEqual(resolveExecutionModel(models), resolveModel(models));
+});
+
+test('resolves a separate execution model for sandboxed pi runs', () => {
+  const models = parseModelsConfig(stringify({ ...config, execution: { provider: 'second', model: 'model-c' } }));
+  assert.deepEqual(models.default, config.default);
+  assert.deepEqual(models.execution, { provider: 'second', model: 'model-c' });
+  assert.deepEqual(resolveExecutionModel(models), { provider: 'second', model: 'model-c', baseUrl: second.baseUrl, key: second.key });
+  for (const invalid of [
+    { ...config, execution: {} },
+    { ...config, execution: { provider: 'missing', model: 'model-a' } },
+    { ...config, execution: { provider: 'first', model: 'model-c' } },
+  ]) {
+    assert.throws(() => parseModelsConfig(stringify(invalid)), /config\/models.yaml/);
+  }
 });
 
 test('resolves the configured default provider endpoint, key, and model', () => {

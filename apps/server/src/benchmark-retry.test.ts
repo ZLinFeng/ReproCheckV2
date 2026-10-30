@@ -1,18 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { extractRepairCommand, runWithRetry, withRepairDeadline } from './benchmark-retry.js';
+import { runWithRetry, withRepairDeadline } from './benchmark-retry.js';
 import type { Benchmark } from './benchmark.js';
 
 const plan: Benchmark = { runtime: 'python', network: false, command: 'bad', metric: 'time', unit: 's', comparison: null, expected: null, basis: 'fixture' };
-
-test('accepts unambiguous repair formats and rejects conflicting commands', () => {
-  assert.equal(extractRepairCommand({ command: 'fixed' }), 'fixed');
-  assert.equal(extractRepairCommand({ benchmark: { command: 'fixed' } }), 'fixed');
-  assert.equal(extractRepairCommand({ experiment: { command: 'fixed' } }), 'fixed');
-  assert.equal(extractRepairCommand({ experiment: { benchmark: { command: 'fixed' } } }), 'fixed');
-  assert.equal(extractRepairCommand({ command: null }), null);
-  assert.throws(() => extractRepairCommand({ command: 'one', benchmark: { command: 'two' } }), /conflicting/);
-});
 
 test('closes an independent repair session when its deadline expires', async () => {
   let closed = false;

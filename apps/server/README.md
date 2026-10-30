@@ -15,6 +15,19 @@
 
 未配置上限时使用 8192。模型、网关和剩余上下文可能进一步限制输出；它不是整次调查的费用预算。修改配置后需要重启。
 
+`default` 是服务自身（指标提取、计划、评估）使用的模型。沙箱实验里由 Pi 执行验证时使用 `execution` 指定的模型；未配置 `execution` 时沿用 `default`：
+
+```yaml
+default:
+  provider: tokenfactory
+  model: nvidia/nemotron-3-super-120b-a12b
+execution:
+  provider: tokenfactory
+  model: nvidia/Nemotron-3-Ultra-550b-a55b
+```
+
+两个模型都必须列在对应 Provider 的 `models` 中。
+
 ## 启动与调用
 
 ```sh
@@ -33,9 +46,9 @@ curl -N http://127.0.0.1:3000/investigations \
 
 仅接受公开 GitHub 仓库根地址；每次调查固定到克隆得到的 commit。响应是 SSE：`start` 给出 `sessionId`；`progress` 的 `stage` 依次为 `source`、`metrics`、`plan`、可选的 `online`、`sandbox`、`benchmark`、`assessment`；`detail` 提供阶段完成后的宣称、方案、来源或执行结果，执行阶段可能逐项发送；`message` 是摘要；`done` 返回摘要和 `reportUrl`；异常失败返回 `error`。调查不设总时限，但客户端断开连接会取消调查，各步骤仍有各自的时限。HTTP 200 仅代表 SSE 建立，必须检查终止事件。页面展示阶段结果，不提供模型内部思维或实时命令输出。
 
-完成后可用 `GET /investigations/<sessionId>` 读取报告；进行中或失败的任务返回状态和阶段。数据保存在 `apps/server/data/investigations/<sessionId>/`：`source.json`、`metrics.json`、`online.json`、`plan.json`、`sandbox.json`、`benchmark.json`、`report.json` 与 `status.json`。失败时保留已经完成的阶段，临时仓库和 Harness 会清理。数据目录已加入 `.gitignore`。
+完成后可用 `GET /investigations/<sessionId>` 读取报告；进行中或失败的任务返回状态和阶段。数据保存在 `apps/server/data/investigations/<sessionId>/`：`source.json`、`metrics.json`、`online.json`、`plan.json`、`sandbox.json`、`benchmark.json`、`report.json` 与 `status.json`。失败时保留已经完成的阶段，临时仓库和 Harness 会清理。数据目录已加入 `.gitignore`。各阶段的模型原文保存在 `model-<stage>.txt`（重试为 `model-<stage>-retry.txt`）。模型返回空响应、无法解析的 JSON 或未通过校验的计划（例如合并多个 claim id、引用未获取的来源）时系统自动重试一次并保留两份原文；`plan` 只为可执行的实验设计执行方案，命令随后单独以纯文本请求并保存在 `model-command-<claimId>.txt`，因此不必嵌在 JSON 字符串中重复转义。声明使用 Pi 或模型（`agent`/`model`）却把 `network` 写成 `false` 的计划会在规划阶段直接对齐为 `network=true`，不会因此作废；其余无法通过校验的实验会记录具体字段原因，并跳过命令生成。回复被输出上限截断时会以“缩短内容”的提示重试一次。
 
-四个项目 skill 位于 `skills/`，分别负责提取指标、检查证据、设计实验及总结沙箱观察。模型分析时禁用网页工具与 shell；仓库内容只作为待分析数据。系统检查引用是否能在已读取的文档中逐字找到。最终状态只能是 `evidence_only`、`unsupported` 或 `inconclusive`，不会把作者自己提供的基准报告标为已复现。
+四个项目 skill 位于 `skills/`，分别负责提取指标、检查证据、设计实验及总结沙箱观察。模型分析时禁用网页工具与 shell；仓库内容只作为待分析数据。系统检查引用是否能在已读取的文档中逐字找到；如果显示文本仅被简单的行内 HTML 格式标签打断，则保存包含这些标签的原始连续片段。无法核对的引用不会用于执行实验。最终状态只能是 `evidence_only`、`unsupported` 或 `inconclusive`，不会把作者自己提供的基准报告标为已复现。
 
 资料收集会优先读取常见的基准任务说明和 `tasks.py`；长任务文件只提供首尾摘要给模型，并明确标记中间省略。引用仍需通过只读证据检查，不能把这些文件的指令当成系统指令。
 
@@ -45,7 +58,7 @@ curl -N http://127.0.0.1:3000/investigations \
 
 证据读取使用 DSH `sandbox-local` 的 `read-only`，基准执行使用 `workspace-write`：macOS 使用 `sandbox-exec`，Linux 优先使用 `bwrap`，不可用时尝试 Landlock。项目不需要 Docker 或容器镜像；各实验需要的语言运行时和工具须安装在宿主机。若只有 `python3`，实验中也可通过 `python` 调用。沙箱不可用时记录为 unavailable，不会回退为无限制执行；Linux 路径须在目标机器验证。
 
-每次执行复制仓库到独立的磁盘临时工作区，并将 HOME、TMPDIR 和 `REPROCHECK_WORKSPACE` 指向该工作区；结束时清理。实验继承宿主的 PATH，不继承代理变量，并设置 `NO_PROXY=*` 以直接使用本机网络；HOME 与其他环境变量不会完整继承。报告记录宿主操作系统、架构、工具版本、DSH 沙箱的执行等级以及实际网络条件。沙箱限制工作区外的文件写入，但 DSH 也允许写入平台临时目录；它不隔离宿主文件读取、网络和进程。`benchmark.network` 表示实验声明的网络需求，不会禁用网络。命令或代码可能读取当前用户的文件、访问本地服务或外传数据，也可能写入其他允许的临时目录；仅适合接受这些风险的本机环境。实验命令最多运行 30 分钟并限制输出；没有 Docker 原有的 CPU、内存、进程数和磁盘配额。
+每次执行复制仓库到独立的磁盘临时工作区，将 TMPDIR 和 `REPROCHECK_WORKSPACE` 指向该工作区，并使用单独的临时 HOME；结束时清理。实验继承宿主的 PATH，不继承代理变量，并设置 `NO_PROXY=*` 以直接使用本机网络；HOME 与其他环境变量不会完整继承。报告记录宿主操作系统、架构、工具版本、DSH 沙箱的执行等级以及实际网络条件。沙箱限制工作区外的文件写入，但 DSH 也允许写入平台临时目录；它不隔离宿主文件读取、网络和进程。`benchmark.network` 表示实验声明的网络需求，不会禁用网络。命令或代码可能读取当前用户的文件、访问本地服务或外传数据，也可能写入其他允许的临时目录；仅适合接受这些风险的本机环境。实验命令最多运行 30 分钟并限制输出；没有 Docker 原有的 CPU、内存、进程数和磁盘配额。
 
 实验需要代码代理时使用本机安装的 `@earendil-works/pi-coding-agent`（Pi），使用临时 Pi 配置目录。模型实验通过本机代理提供 OpenAI 兼容的 `/chat/completions`，命令环境只包含占位密钥；真实密钥由服务进程持有。但 DSH 不限制宿主文件读取，也不保证密钥安全。模型代理支持配置的 HTTP 内网端点和公网 HTTPS 端点；HTTP 请求中的密钥和数据不会加密。在线搜索经同一代理实现的公网地址检查，但基准命令的网络访问没有被强制经过代理。模型和代理调用可能产生费用。报告记录 Pi 版本和模型名称；替代环境的实验不等于对原结果的精确复现。
 
@@ -53,7 +66,7 @@ curl -N http://127.0.0.1:3000/investigations \
 
 数据集或任务集默认选择最多约 10 个不同样本进行探索性检查；模型或代理实验优先选择 1～3 个配对任务，并在执行限时内为单次调用留足预算。对照实验应使用相同样本，并记录选择方式、实际完成数量和失败情况；不要求跑完全量数据。实验命令须向 stdout 输出一个 JSON 对象，例如 `{"value": 1.23}`，安装日志和逐项进度应写入 stderr。按 `REPROCHECK_PROGRESS ` 前缀输出的结构化样本进度会在执行期间保存到 `benchmark.json`，最多保留 50 条，并明确标记为未经核验；终止时会尽量保留当前尝试的输出。结果中的 `measured` 表示拿到了数值；有合理阈值时 `matched` 表示比较结果，没有阈值时为 `null`。这些均不代表实验方法正确或原宣称已经复现。应人工核对命令、指标、阈值来源、运行环境、样本和基线。实验真正需要的依赖、数据、外部 API 或方法不可用时记录为 `not_runnable`，安装和执行失败会记录进程输出。模型可能犯错，仓库代码也可能输出误导性结果。
 
-命令执行失败或输出格式无效时，系统会把截取的错误输出作为不可信数据交给模型修复命令，最多重试一次；运行环境、网络需求、指标和阈值不变。修复规划使用独立模型会话，限时 15 分钟，超时会关闭该会话并保留原失败；兼容无歧义的顶层或嵌套命令字段，存在冲突时拒绝。所有尝试的命令与结果保存在 `benchmark.json`，环境不可用不会自动重试。每次重试仍受单次执行 30 分钟限制；DSH 请求限时 60 分钟，DSH 模型调用及流空闲限时为 15 分钟，实验内模型代理的上游连接空闲限时为 15 分钟。模型调用可能增加费用；自动修复和公式自检不能保证实验有效。
+执行前先用 `/bin/sh -n` 检查生成命令的语法；若存在 `/bin/dash`，还会用它检查常见的非 POSIX 语法。不完整或无效的命令会要求模型修正一次，仍无效则不执行，原文和修正原文分别保存。此检查不能保证符合 POSIX 或实验方法正确。命令执行失败或输出格式无效时，系统会把截取的错误输出作为不可信数据交给模型修复命令，最多重试一次；运行环境、网络需求、指标和阈值不变。修复规划使用独立模型会话，限时 15 分钟，超时会关闭该会话并保留原失败。所有尝试的命令与结果保存在 `benchmark.json`，环境不可用不会自动重试。每次重试仍受单次执行 30 分钟限制；DSH 请求限时 60 分钟，DSH 模型调用及流空闲限时为 15 分钟，实验内模型代理的上游连接空闲限时为 15 分钟。模型调用可能增加费用；自动修复和公式自检不能保证实验有效。
 
 可以在当前 Harness patch 上继续增加插件。SDK 的 `sdk-minimal` 默认包含本地沙箱提供方，但其默认 `sandbox-policy` 是 `danger-full-access`；`config/dsh-sandbox.example.patch.yml` 演示改为只读。SDK 自带的本地沙箱主要是文件操作约束，不等同于无网络、无宿主读取的隔离容器。若以后启用 shell、子进程或 subagent，需要单独配置隔离策略和工具权限，验证子进程与子代理继承约束，不能仅通过启用插件来宣称具备隔离能力。
 

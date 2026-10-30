@@ -3,17 +3,6 @@ import { parseBenchmark, type Benchmark, type runBenchmark } from './benchmark.j
 type Result = Awaited<ReturnType<typeof runBenchmark>>;
 type Attempt = { benchmark: Benchmark; result: Result };
 
-export function extractRepairCommand(value: unknown): string | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid repair response.');
-  const response = value as Record<string, unknown>;
-  const object = (item: unknown): Record<string, unknown> => item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : {};
-  const experiment = object(response.experiment);
-  const candidates = [response.command, object(response.benchmark).command, experiment.command, object(experiment.benchmark).command]
-    .filter((item): item is string => typeof item === 'string' && !!item.trim());
-  if (new Set(candidates).size > 1) throw new Error('Repair response contains conflicting commands.');
-  return candidates[0] ?? null;
-}
-
 export async function withRepairDeadline<T>(run: () => Promise<T>, close: () => Promise<void>, signal: AbortSignal, timeoutMs = 15 * 60_000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abort = () => {};

@@ -28,13 +28,23 @@ export function parseBenchmark(value: unknown): Benchmark | null {
   if (typeof value !== 'object' || Array.isArray(value)) throw new Error('The model returned an invalid execution plan.');
   const item = value as Record<string, unknown>;
   const validText = (v: unknown, max: number) => typeof v === 'string' && !!v.trim() && v.length <= max;
-  if (!['python', 'node'].includes(String(item.runtime)) || typeof item.network !== 'boolean'
-    || (item.agent !== undefined && typeof item.agent !== 'boolean') || (item.model !== undefined && typeof item.model !== 'boolean')
-    || ((item.agent || item.model) && !item.network) || (item.agent && item.runtime !== 'node') || !validText(item.command, 16000)
-    || !validText(item.metric, 200) || !validText(item.unit, 100) || !validText(item.basis, 2000)
-    || !((item.comparison === null && item.expected === null)
-      || (['lt', 'lte', 'eq', 'gte', 'gt'].includes(String(item.comparison))
-        && typeof item.expected === 'number' && Number.isFinite(item.expected)))) throw new Error('The model returned an invalid execution plan.');
+  // Report every problem at once: a single generic message made a forgotten network flag indistinguishable from an unsafe command.
+  const problems: string[] = [];
+  if (!['python', 'node'].includes(String(item.runtime))) problems.push('runtime must be "python" or "node"');
+  if (typeof item.network !== 'boolean') problems.push('network must be true or false');
+  if (item.agent !== undefined && typeof item.agent !== 'boolean') problems.push('agent must be true or false');
+  if (item.model !== undefined && typeof item.model !== 'boolean') problems.push('model must be true or false');
+  if ((item.agent === true || item.model === true) && item.network !== true) problems.push('network must be true when agent or model is used');
+  if (item.agent === true && item.runtime !== 'node') problems.push('agent runs require the node runtime');
+  if (!validText(item.command, 16000)) problems.push('command must be a non-empty string of at most 16000 characters');
+  if (!validText(item.metric, 200)) problems.push('metric must be a non-empty string of at most 200 characters');
+  if (!validText(item.unit, 100)) problems.push('unit must be a non-empty string of at most 100 characters');
+  if (!validText(item.basis, 2000)) problems.push('basis must be a non-empty string of at most 2000 characters');
+  const paired = item.comparison === null && item.expected === null;
+  const threshold = ['lt', 'lte', 'eq', 'gte', 'gt'].includes(String(item.comparison))
+    && typeof item.expected === 'number' && Number.isFinite(item.expected);
+  if (!paired && !threshold) problems.push('comparison and expected must both be null, or a comparison operator paired with a finite expected number');
+  if (problems.length) throw new Error(`The model returned an invalid execution plan: ${[...new Set(problems)].join('; ')}.`);
   return item as Benchmark;
 }
 
@@ -73,6 +83,7 @@ export async function runBenchmark(root: string, benchmark: Benchmark, signal?: 
   copyRepository = true, onInterrupted?: (output: { stdout: string; stderr: string }) => void,
   onProgress?: (progress: BenchmarkProgress) => void, publicSearchProxy = false) {
   let workspace: string | undefined;
+  let home: string | undefined;
   let proxy: Server | undefined;
   try {
     const pi = benchmark.agent ? await findPi() : null;
@@ -86,10 +97,11 @@ export async function runBenchmark(root: string, benchmark: Benchmark, signal?: 
     if (benchmark.runtime === 'node' && !capabilities.tools.node) return { status: 'unavailable' as const, error: 'Node.js was not found on the host.' };
     workspace = await realpath(await mkdtemp(join(tmpdir(), 'reprocheck-run-')));
     const bin = join(workspace, 'bin');
-    const home = join(workspace, 'home');
+    // HOME stays outside the workspace tree: tools that refuse to initialize in a directory
+    // containing $HOME (codegraph, for one) would otherwise reject the workspace itself.
+    home = await realpath(await mkdtemp(join(tmpdir(), 'reprocheck-home-')));
     const cwd = copyRepository ? join(workspace, 'repository') : workspace;
     await mkdir(bin);
-    await mkdir(home);
     if (copyRepository) await cp(root, cwd, { recursive: true, verbatimSymlinks: true });
     if (!capabilities.tools.python && python) await symlink(python.path, join(bin, 'python'));
     const env: NodeJS.ProcessEnv = { PATH: `${bin}:${process.env.PATH || '/usr/bin:/bin'}`, HOME: home,
@@ -168,6 +180,7 @@ export async function runBenchmark(root: string, benchmark: Benchmark, signal?: 
     return { status: 'failed' as const, error: error instanceof Error ? error.message : 'Host execution failed.' };
   } finally {
     if (proxy) { proxy.closeAllConnections(); await new Promise<void>((resolve) => proxy!.close(() => resolve())); }
+    if (home) await rm(home, { recursive: true, force: true });
     if (workspace) await rm(workspace, { recursive: true, force: true });
   }
 }

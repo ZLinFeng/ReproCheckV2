@@ -15,8 +15,10 @@ test('validates executable plans', () => {
   assert.throws(() => parseBenchmark({ ...benchmark, expected: Infinity, command: 'echo' }));
   assert.throws(() => parseBenchmark({ ...benchmark, command: '' }));
   assert.throws(() => parseBenchmark({ ...benchmark, network: 'yes', command: 'echo' }));
-  assert.throws(() => parseBenchmark({ ...benchmark, agent: true, command: 'echo' }));
-  assert.throws(() => parseBenchmark({ ...benchmark, network: true, agent: true, command: 'echo' }));
+  assert.throws(() => parseBenchmark({ ...benchmark, agent: true, command: 'echo' }),
+    /network must be true when agent or model is used/);
+  assert.throws(() => parseBenchmark({ ...benchmark, network: true, agent: true, command: 'echo' }),
+    /agent runs require the node runtime/);
   assert.throws(() => parseBenchmark({ ...benchmark, model: true, command: 'echo' }));
   assert.ok(parseBenchmark({ ...benchmark, command: 'x'.repeat(16000) }));
   assert.throws(() => parseBenchmark({ ...benchmark, command: 'x'.repeat(16001) }));
@@ -101,6 +103,39 @@ test('uses the host Pi with temporary model configuration and a local gateway', 
     assert.equal(result.model, 'test-model');
     assert.ok(!JSON.stringify(result).includes('secret-test-key'));
   }
+});
+
+test('runs isolated Pi arms without replacing the configured model directory', { skip: !(await findPi()), timeout: 30000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'reprocheck-pi-skills-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'skills/target'), { recursive: true });
+  await mkdir(join(root, '.agents/skills/leak'), { recursive: true });
+  await writeFile(join(root, 'skills/target/SKILL.md'), '---\nname: target\ndescription: Explicit skill\n---\nEXPLICIT_SKILL_TEST_TOKEN\n');
+  await writeFile(join(root, '.agents/skills/leak/SKILL.md'), '---\nname: leak\ndescription: AUTO_SKILL_SHOULD_NOT_APPEAR\n---\nleak\n');
+  await writeFile(join(root, 'AGENTS.md'), 'CONTEXT_SHOULD_NOT_APPEAR');
+  const requests: string[] = [];
+  const upstream = createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(body);
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const choice of [{ delta: { role: 'assistant', content: 'done' }, finish_reason: null }, { delta: {}, finish_reason: 'stop' }]) {
+      response.write(`data: ${JSON.stringify({ id: 'test', object: 'chat.completion.chunk', created: 1, model: 'test-model', choices: [{ index: 0, ...choice }] })}\n\n`);
+    }
+    response.end('data: [DONE]\n\n');
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => upstream.close(() => resolve())));
+  const port = (upstream.address() as { port: number }).port;
+  const flags = '--offline --no-approve --no-skills --no-context-files --no-extensions --no-session --provider reprocheck --model "$REPROCHECK_MODEL_ID"';
+  const command = `set -e\npi ${flags} -p 'baseline task' >&2\npi ${flags} --skill "$PWD/skills/target/SKILL.md" -p '/skill:target skill task' >&2\necho '{"value":1}'`;
+  const result = await runBenchmark(root, { ...benchmark, runtime: 'node', network: true, agent: true, model: true, command, expected: 1 }, undefined,
+    { baseUrl: `http://127.0.0.1:${port}/v1`, key: 'secret-test-key', model: 'test-model' });
+  assert.equal(result.status, 'measured', JSON.stringify(result));
+  assert.equal(requests.length, 2);
+  assert.doesNotMatch(requests[0], /EXPLICIT_SKILL_TEST_TOKEN|AUTO_SKILL_SHOULD_NOT_APPEAR|CONTEXT_SHOULD_NOT_APPEAR/);
+  assert.match(requests[1], /EXPLICIT_SKILL_TEST_TOKEN/);
+  assert.doesNotMatch(requests[1], /AUTO_SKILL_SHOULD_NOT_APPEAR|CONTEXT_SHOULD_NOT_APPEAR/);
 });
 
 test('uses the configured private HTTP model endpoint through the model gateway', { skip: process.platform !== 'darwin' && process.platform !== 'linux', timeout: 30000 }, async (t) => {

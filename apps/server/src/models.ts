@@ -17,9 +17,14 @@ export function parseModelsConfig(source: string) {
   const config: unknown = parse(source);
   assert.ok(isRecord(config) && isRecord(config.default) && isRecord(config.providers),
     'config/models.yaml 必须包含 default 和 providers');
-  const { provider, model } = config.default;
-  assert.ok(typeof provider === 'string' && typeof model === 'string',
-    'config/models.yaml 的 default 必须包含 provider 和 model 字符串');
+  const selection = (value: unknown, field: string) => {
+    assert.ok(isRecord(value) && typeof value.provider === 'string' && typeof value.model === 'string',
+      `config/models.yaml 的 ${field} 必须包含 provider 和 model 字符串`);
+    return { provider: value.provider as string, model: value.model as string };
+  };
+  const defaults = selection(config.default, 'default');
+  // Execution model runs pi inside experiment sandboxes; it falls back to the default when unset.
+  const execution = config.execution === undefined ? defaults : selection(config.execution, 'execution');
 
   const providers = new Map<string, { baseUrl: string; key: string; models: string[]; modelLimits?: Record<string, { contextWindow: number; maxTokens: number }> }>();
   for (const [name, entry] of Object.entries(config.providers)) {
@@ -47,9 +52,11 @@ export function parseModelsConfig(source: string) {
     }
     providers.set(name, { baseUrl: entry.baseUrl, key: entry.key, models: entry.models, ...(modelLimits ? { modelLimits } : {}) });
   }
-  assert.ok(providers.get(provider)?.models.includes(model),
+  assert.ok(providers.get(defaults.provider)?.models.includes(defaults.model),
     'config/models.yaml 的默认 Provider/Model 必须在 providers 中配置');
-  return { default: { provider, model }, providers };
+  assert.ok(providers.get(execution.provider)?.models.includes(execution.model),
+    'config/models.yaml 的 execution Provider/Model 必须在 providers 中配置');
+  return { default: defaults, execution, providers };
 }
 
 export const modelsPlugin = fp(async (app) => {
@@ -58,7 +65,15 @@ export const modelsPlugin = fp(async (app) => {
 }, { name: 'models', fastify: '5.x' });
 
 export function resolveModel(config: ReturnType<typeof parseModelsConfig>) {
-  const { provider, model } = config.default;
+  return resolveSelection(config, config.default);
+}
+
+export function resolveExecutionModel(config: ReturnType<typeof parseModelsConfig>) {
+  return resolveSelection(config, config.execution);
+}
+
+function resolveSelection(config: ReturnType<typeof parseModelsConfig>, selection: { provider: string; model: string }) {
+  const { provider, model } = selection;
   const settings = config.providers.get(provider);
   if (!settings?.models.includes(model)) {
     throw new Error('Provider/Model 未在 config/models.yaml 中配置');
